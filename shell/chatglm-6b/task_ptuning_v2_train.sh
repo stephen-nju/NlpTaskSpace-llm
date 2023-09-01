@@ -12,14 +12,15 @@ export MODEL_PATH=/home/zhubin/model/chatglm-6b/
 export TRAIN_DATA=/home/zhubin/train_data/AdvertiseGen/train.json
 export VALID_DATA=/home/zhubin/train_data/AdvertiseGen/dev.json
 
-CUDA_VISIBLE_DEVICES=3 python3 llm/chatglm-6b/ptuning/main.py \
+# CUDA_VISIBLE_DEVICES=2,3 
+torchrun --nnodes 1 --nproc_per_node 4 llm/chatglm-6b/ptuning/main.py \
     --do_train \
-    --train_file ${TRAIN_DATA}\
-    --validation_file ${VALID_DATA}\
+    --train_file ${TRAIN_DATA} \
+    --validation_file ${VALID_DATA} \
     --prompt_column content \
     --response_column summary \
     --overwrite_cache \
-    --model_name_or_path ${MODEL_PATH}\
+    --model_name_or_path ${MODEL_PATH} \
     --output_dir output/adgen-chatglm-6b-pt-$PRE_SEQ_LEN-$LR \
     --overwrite_output_dir \
     --max_source_length 64 \

@@ -12,7 +12,7 @@ export MODEL_PATH=/home/zhubin/model/chatglm-6b/
 export TRAIN_DATA=/home/zhubin/train_data/AdvertiseGen/train.json
 export VALID_DATA=/home/zhubin/train_data/AdvertiseGen/dev.json
 
-CUDA_VISIBLE_DEVICES=3 python3 llm/chatglm-6b/lora/task_lora_hf_trainer_train.py \
+CUDA_VISIBLE_DEVICES=2,3 python3 llm/chatglm-6b/lora/task_lora_hf_trainer_train.py \
     --do_train \
     --train_file ${TRAIN_DATA}\
     --validation_file ${VALID_DATA}\
