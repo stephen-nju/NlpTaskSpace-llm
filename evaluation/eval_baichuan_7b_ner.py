@@ -1,6 +1,7 @@
 from tqdm import tqdm
 import numpy as np
 import torch
+import json
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -11,6 +12,10 @@ from transformers import (
 import argparse
 from peft import PeftModel
 import json
+from metrics.ner import report_metric
+from tqdm import tqdm
+
+key_name_map = {"品牌": "HP", "品类": "HC", "系列型号": "XL"}
 
 
 def parse_argument():
@@ -29,6 +34,63 @@ def parse_argument():
                         default="ceval_output",
                         help="output directory")
     return parser.parse_args()
+
+
+def postprocess_outputdata(output_data):
+    res_gt = []
+    res_tg = []
+    gt = output_data[0]
+    # gt ground_truth
+    target = output_data[1]
+    if isinstance(gt, str):
+        gt_dict = json.loads(gt)
+    elif isinstance(gt, dict):
+        gt_dict = gt
+    else:
+        return res_gt, res_tg
+
+    for k, v in gt_dict.items():
+        if k in key_name_map:
+            name = key_name_map[k]
+            for tv in v:
+                res_gt.append({
+                    "type": name,
+                    "span": tv,
+                    "start": None,
+                    "end": None
+                })
+
+    # 解析target数据，输入与输出有特殊分割符
+    tg = target.split(" ->")[-1]
+    try:
+        tg_dict = eval(tg)
+    except:
+        return res_gt, res_tg
+    if isinstance(tg_dict, dict):
+        for k, v in tg_dict.items():
+            if k in key_name_map:
+                type_name = key_name_map[k]
+                if v is None:
+                    continue
+                if isinstance(v, list):
+                    for tv in v:
+                        res_tg.append({
+                            "type": type_name,
+                            "span": tv,
+                            "start": None,
+                            "end": None
+                        })
+                elif isinstance(v, str):
+                    res_tg.append({
+                        "type": type_name,
+                        "span": v,
+                        "start": None,
+                        "end": None
+                    })
+                else:
+                    continue
+
+    return res_gt, res_tg
 
 
 def main():
@@ -64,7 +126,11 @@ def main():
             data = json.loads(s)
             eval_data.append(data)
 
-    for data in eval_data:
+    output_data = []
+
+    for data in tqdm(eval_data):
+        # if index > 10:
+        #     break
         inp = data["context"]
         inputs = prefix + inp + " ->"
         input_ids = tokenizer.encode(inputs, return_tensors="pt").cuda()
@@ -77,9 +143,15 @@ def main():
         output_text = tokenizer.decode(output.sequences[0],
                                        skip_special_tokens=True,
                                        clean_up_tokenization_spaces=False)
+        gt, tg = postprocess_outputdata([data["ner"], output_text])
+        output_data.append({"ground_truth": gt, "baichuan": tg})
 
-        print(output_text)
-        print(f"============\n")
+    input_dict = {"data": output_data, "total": len(output_data)}
+
+    with open("output.json", "w", encoding="utf-8") as g:
+        json.dump(input_dict, g, ensure_ascii=False, indent=2)
+
+    report_metric(input_dict)
 
 
 if __name__ == "__main__":

@@ -46,21 +46,18 @@ seed_everything(42)
 
 
 class Baichuan7bNerInputExample:
-
     def __init__(self, text, labels) -> None:
         self.text = text
         self.labels = labels
 
 
 class Baichuan7bNerInputFeature:
-
     def __init__(self, input_ids, labels) -> None:
         self.input_ids = input_ids
         self.labels = labels
 
 
-def convert_example_to_feature(example, tokenizer, max_source_length,
-                               max_target_length, pad_token_id, eos_token_id):
+def convert_example_to_feature(example, tokenizer, max_source_length, max_target_length, pad_token_id, eos_token_id):
     prefix = """命名实体识别：抽取文本中的 品牌，品类，系列型号 这三类命名实体，并按照json格式返回结果。\n\n"""
 
     max_seq_length = max_source_length + max_target_length
@@ -95,13 +92,9 @@ def convert_example_to_feature(example, tokenizer, max_source_length,
     return Baichuan7bNerInputFeature(input_ids=input_ids, labels=labels)
 
 
-def convert_examples_to_features(examples,
-                                 tokenizer,
-                                 max_source_length,
-                                 max_target_length,
-                                 pad_token_id,
-                                 eos_token_id,
-                                 threads=4):
+def convert_examples_to_features(
+    examples, tokenizer, max_source_length, max_target_length, pad_token_id, eos_token_id, threads=4
+):
     threads = min(threads, cpu_count())
     with Pool(threads) as p:
         annotate_ = partial(
@@ -117,12 +110,12 @@ def convert_examples_to_features(examples,
                 p.imap(annotate_, examples, chunksize=32),
                 total=len(examples),
                 desc="convert examples to features",
-            ))
+            )
+        )
     return features
 
 
 class Baichuan7bNerDataset(Dataset):
-
     def __init__(self, features) -> None:
         self.features = features
         super().__init__()
@@ -140,11 +133,9 @@ class Baichuan7bNerDataset(Dataset):
 
 
 class Baichuan7bNerDataModule(LightningDataModule):
-
     def __init__(self, args) -> None:
         self.args = args
-        config = AutoConfig.from_pretrained(args.model_name_or_path,
-                                            trust_remote_code=True)
+        config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(
             args.model_name_or_path,
             use_fast=not args.use_slow_tokenizer,
@@ -152,8 +143,7 @@ class Baichuan7bNerDataModule(LightningDataModule):
         )
         self.pad_token_id = 0
         self.eos_token_id = 2
-        self.cache_path = os.path.join(os.path.dirname(args.train_data),
-                                       "cache")
+        self.cache_path = os.path.join(os.path.dirname(args.train_data), "cache")
         if not os.path.exists(self.cache_path):
             os.makedirs(self.cache_path)
         super().__init__()
@@ -169,8 +159,7 @@ class Baichuan7bNerDataModule(LightningDataModule):
             eos_token_id=self.eos_token_id,
         )
 
-        with open(os.path.join(self.cache_path, "train_feature.pkl"),
-                  "wb") as g:
+        with open(os.path.join(self.cache_path, "train_feature.pkl"), "wb") as g:
             pickle.dump(train_features, g)
 
         # dev_examples = list(self.read_train_data(self.args.dev_data))
@@ -189,12 +178,10 @@ class Baichuan7bNerDataModule(LightningDataModule):
         with open(path, "r", encoding="utf-8") as g:
             for line in g:
                 data = json.loads(line)
-                yield Baichuan7bNerInputExample(text=data["context"],
-                                                labels=data["ner"])
+                yield Baichuan7bNerInputExample(text=data["context"], labels=data["ner"])
 
     def setup(self, stage: str) -> None:
-        with open(os.path.join(self.cache_path, "train_feature.pkl"),
-                  "rb") as g:
+        with open(os.path.join(self.cache_path, "train_feature.pkl"), "rb") as g:
             self.train_features = pickle.load(g)
 
         # with open(os.path.join(self.cache_path, "dev_feature.pkl"), "rb") as g:
@@ -218,13 +205,11 @@ class Baichuan7bNerDataModule(LightningDataModule):
 
 
 class Baichuan7bNerModule(LightningModule):
-
     def __init__(self, args):
         super().__init__()
         self.args = args
         # 加载模型
-        config = AutoConfig.from_pretrained(args.model_name_or_path,
-                                            trust_remote_code=True)
+        config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
         self.model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
@@ -272,20 +257,12 @@ class Baichuan7bNerModule(LightningModule):
         no_decay = ["bias", "layer_norm.weight"]
         optimizer_grouped_parameters = [
             {
-                "params": [
-                    p for n, p in model.named_parameters()
-                    if not any(nd in n for nd in no_decay)
-                ],
-                "weight_decay":
-                self.args.weight_decay,
+                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": self.args.weight_decay,
             },
             {
-                "params": [
-                    p for n, p in model.named_parameters()
-                    if any(nd in n for nd in no_decay)
-                ],
-                "weight_decay":
-                0.0,
+                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
             },
         ]
         if self.args.optimizer == "adam":
@@ -305,9 +282,9 @@ class Baichuan7bNerModule(LightningModule):
 
         num_gpus = self.trainer.num_devices
         # 注：只有在使用pytorch Lightning的LightningDataModule 时候才可以使用该方式回去训练集大小
-        t_total = (len(self.trainer.datamodule.train_dataloader()) //
-                   (self.trainer.accumulate_grad_batches * num_gpus) +
-                   1) * self.args.max_epochs
+        t_total = (
+            len(self.trainer.datamodule.train_dataloader()) // (self.trainer.accumulate_grad_batches * num_gpus) + 1
+        ) * self.args.max_epochs
         warmup_steps = int(self.args.warmup_proportion * t_total)
 
         if self.args.lr_scheduler == "onecycle":
@@ -336,10 +313,12 @@ class Baichuan7bNerModule(LightningModule):
         elif self.args.lr_scheduler == "cawr":
             # TODO
             step = (len(self.trainer.datamodule.train_dataloader())) // (
-                self.trainer.accumulate_grad_batches * num_gpus + 1)
+                self.trainer.accumulate_grad_batches * num_gpus + 1
+            )
 
             scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                optimizer, step * self.args.rewarm_epoch_num, 1)
+                optimizer, step * self.args.rewarm_epoch_num, 1
+            )
         else:
             raise ValueError("lr_scheduler does not exist.")
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
@@ -351,23 +330,11 @@ class Baichuan7bNerModule(LightningModule):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="train tplinker ner model")
-    parser.add_argument("--output_dir",
-                        type=str,
-                        default="./output_dir/",
-                        help="")
+    parser.add_argument("--output_dir", type=str, default="./output_dir/", help="")
 
-    parser.add_argument("--train_data",
-                        type=str,
-                        default="",
-                        help="train data path")
-    parser.add_argument("--test_data",
-                        type=str,
-                        default="",
-                        help="test data path")
-    parser.add_argument("--dev_data",
-                        type=str,
-                        default="",
-                        help="dev data path")
+    parser.add_argument("--train_data", type=str, default="", help="train data path")
+    parser.add_argument("--test_data", type=str, default="", help="test data path")
+    parser.add_argument("--dev_data", type=str, default="", help="dev data path")
 
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
 
@@ -382,10 +349,7 @@ if __name__ == "__main__":
         help="cawr learning scheduler rewarm epoch num",
         default=2,
     )
-    parser.add_argument("--workers",
-                        type=int,
-                        default=0,
-                        help="num workers for dataloader")
+    parser.add_argument("--workers", type=int, default=0, help="num workers for dataloader")
     parser.add_argument(
         "--warmup_proportion",
         default=0.1,
@@ -408,16 +372,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        help=
-        "Path to pretrained model or model identifier from huggingface.co/models.",
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
     )
     parser.add_argument("--optimizer", type=str, help=("model optimizer"))
     parser.add_argument(
         "--use_slow_tokenizer",
         action="store_true",
-        help=
-        "If passed, will use a slow tokenizer (not backed by the �� Tokenizers library).",
+        help="If passed, will use a slow tokenizer (not backed by the �� Tokenizers library).",
     )
     parser.add_argument(
         "--per_device_train_batch_size",
@@ -435,19 +397,14 @@ if __name__ == "__main__":
         "--learning_rate",
         type=float,
         default=5e-5,
-        help=
-        "Initial learning rate (after the potential warmup period) to use.",
+        help="Initial learning rate (after the potential warmup period) to use.",
     )
-    parser.add_argument("--weight_decay",
-                        type=float,
-                        default=0.01,
-                        help="Weight decay to use.")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay to use.")
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
         default=1,
-        help=
-        "Number of updates steps to accumulate before performing a backward/update pass.",
+        help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
         "--num_warmup_steps",
@@ -471,10 +428,11 @@ if __name__ == "__main__":
         "--block_size",
         type=int,
         default=None,
-        help=
-        ("Optional input sequence length after tokenization. The training dataset will be truncated in block of"
-         " this size for training. Default to the model max input length for single sentence inputs (take into"
-         " account special tokens)."),
+        help=(
+            "Optional input sequence length after tokenization. The training dataset will be truncated in block of"
+            " this size for training. Default to the model max input length for single sentence inputs (take into"
+            " account special tokens)."
+        ),
     )
 
     parser.add_argument(
@@ -497,8 +455,7 @@ if __name__ == "__main__":
         "--checkpointing_steps",
         type=str,
         default=None,
-        help=
-        "Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
+        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -515,26 +472,27 @@ if __name__ == "__main__":
     parser.add_argument(
         "--low_cpu_mem_usage",
         action="store_true",
-        help=
-        ("It is an option to create the model as an empty shell, then only materialize its parameters when the pretrained weights are loaded."
-         "If passed, LLM loading time and RAM consumption will be benefited."),
+        help=(
+            "It is an option to create the model as an empty shell, then only materialize its parameters when the pretrained weights are loaded."
+            "If passed, LLM loading time and RAM consumption will be benefited."
+        ),
     )
     parser.add_argument("--max_source_length", type=int, default=128, help="")
     parser.add_argument(
         "--max_target_length",
         type=int,
         default=32,
-        help=
-        ("The maximum total sequence length for target text after tokenization. Sequences longer "
-         "than this will be truncated, sequences shorter will be padded."),
+        help=(
+            "The maximum total sequence length for target text after tokenization. Sequences longer "
+            "than this will be truncated, sequences shorter will be padded."
+        ),
     )
 
     parser.add_argument(
         "--ignore_pad_token_for_loss",
         type=bool,
         default=True,
-        help=
-        "Whether to ignore the tokens corresponding to padded labels in the loss computation or not.",
+        help="Whether to ignore the tokens corresponding to padded labels in the loss computation or not.",
     )
 
     parser.add_argument(

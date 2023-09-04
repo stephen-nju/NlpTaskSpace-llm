@@ -12,7 +12,7 @@ export TRAIN_DATA=/home/zhubin/train_data/baichuan/dev.json
 export VALID_DATA=/home/zhubin/train_data/baichuan/dev.json
 
 # ddp
-CUDA_VISIBLE_DEVICES=0 python evaluation/eval_baichuan_7b_ner.py \
+CUDA_VISIBLE_DEVICES=2 python evaluation/eval_baichuan_7b_ner.py \
 	--output_dir ${PROJECT_PATH}/output/trainer \
 	--dev_data ${VALID_DATA} \
 	--model_name_or_path ${MODEL_PATH} \

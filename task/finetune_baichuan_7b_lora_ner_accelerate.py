@@ -823,7 +823,8 @@ def main():
                     accelerator.save_state(output_dir)
             if completed_steps >= args.max_train_steps:
                 break
-
+    
+    # 每个epoch 验证一次
         model.eval()
         losses = []
         for step, batch in enumerate(eval_dataloader):
