@@ -1,17 +1,17 @@
 # 先激活环境
-export PROJECT_PATH=/home/zhubin/code/NlpTaskSpace-llm/
+export PROJECT_PATH=/home/zb/code/NlpTaskSpace-llm/
 
 cd ${PROJECT_PATH}
 
 export PYTHONPATH=${PROJECT_PATH}
 
-export MODEL_PATH=/home/zhubin/model/Baichuan-7B/
+export MODEL_PATH=/data/SHARE/MODELS/BAICHUAN/Baichuan-7B/
 
-export TRAIN_DATA=/home/zhubin/train_data/baichuan/dev.json
-export VALID_DATA=/home/zhubin/train_data/baichuan/dev.json
+export TRAIN_DATA=/home/zb/train_data/baichuan/dev.json
+export VALID_DATA=/home/zb/train_data/baichuan/dev.json
 
 # ddp
-CUDA_VISIBLE_DEVICES=2,3 accelerate launch --num_processes 2 task/finetune_baichuan_7b_lora_ner_trainer.py \
+CUDA_VISIBLE_DEVICES=4,5 accelerate launch --num_processes 2 task/finetune_baichuan_7b_lora_ner_trainer.py \
 	--do_train \
 	--output_dir ${PROJECT_PATH}/output/trainer \
 	--overwrite_output_dir \

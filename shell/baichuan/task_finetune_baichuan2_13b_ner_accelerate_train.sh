@@ -5,11 +5,12 @@ cd ${PROJECT_PATH}
 
 export PYTHONPATH=${PROJECT_PATH}
 
-export MODEL_PATH=/data/SHARE/MODELS/BAICHUAN/Baichuan-7B/
-export TRAIN_DATA=/home/zb/train_data/baichuan/dev.json
+export MODEL_PATH=/data/SHARE/MODELS/BAICHUAN/Baichuan2-13B-Base/
+
+export TRAIN_DATA=/home/zb/train_data/baichuan/train.json
 export VALID_DATA=/home/zb/train_data/baichuan/dev.json
 
-CUDA_VISIBLE_DEVICES=5,6 accelerate launch --num_processes=2 --mixed_precision=fp16 --main_process_port=20655 task/finetune_baichuan_7b_lora_ner_accelerate.py \
+CUDA_VISIBLE_DEVICES=5,6 accelerate launch --num_processes=2 --mixed_precision=fp16 --main_process_port=29601 task/finetune_baichuan2_13b_lora_ner_accelerate.py \
 	--train_file ${TRAIN_DATA} \
 	--validation_file ${VALID_DATA} \
 	--num_train_epochs 1 \
