@@ -1,19 +1,20 @@
 """
-
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
 import argparse
+import gc
 import json
 import logging
 import math
 import os
 import random
+import threading
 from itertools import chain
-from pathlib import Path
 
 import bitsandbytes as bnb
 import datasets
+import psutil
 import torch
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
@@ -40,7 +41,6 @@ from transformers.utils import (
     send_example_telemetry,
 )
 
-
 # WLoraConfioill error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.29.2")
 
@@ -48,6 +48,57 @@ logger = get_logger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+
+def b2mb(x):
+    # 字节转化
+    return int(x / 2**20)
+
+
+# def b2gb(x):
+#     return int(x/2**30)
+
+
+class TorchTracemalloc:
+    def __enter__(self):
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_max_memory_allocated()  # reset the peak gauge to zero_grad
+        self.begin = torch.cuda.memory_allocated()
+        self.process = psutil.Process()
+        self.cpu_begin = self.cpu_mem_used()
+        self.peak_monitoring = True
+        peak_monitor_thread = threading.Thread(target=self.peak_monitor_func)
+        peak_monitor_thread.daemon = True
+        peak_monitor_thread.start()
+        return self
+
+    def cpu_mem_used(self):
+        """get resident set size memory for the current process"""
+        return self.process.memeory_info().rss
+
+    def peak_monitor_func(self):
+        self.cpu_peak = -1
+        while True:
+            self.cpu_peak = max(self.cpu_mem_used(), self.cpu_peak)
+
+            # can't sleep or will not catch the peak right (this comment is here on purpose)
+            # time.sleep(0.001) # 1msec
+            if not self.peak_monitoring:
+                break
+
+    def __exit__(self, *exc):
+        self.peak_monitoring = False
+        gc.collect()
+        torch.cuda.empty_cache()
+        self.end = torch.cuda.memory_allocated()
+        self.peak = torch.cuda.max_memory_allocated()
+        self.used = b2mb(self.end - self.begin)
+        self.peaked = b2mb(self.peak - self.begin)
+        self.cpu_end = self.cpu_mem_used()
+        self.cpu_used = b2mb(self.cpu_end - self.cpu_begin)
+        self.cpu_peaked = b2mb(self.cpu_peak - self.cpu_begin)
+        # print(f"delta used/peak {self.used:4d}/{self.peaked:4d}")'
 
 
 def parse_args():
@@ -197,13 +248,6 @@ def parse_args():
         action="store_true",
         help="Do not keep line breaks when using TXT files.",
     )
-
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        help="The name of the repository to keep in sync with the local `output_dir`.",
-    )
-    parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
     parser.add_argument(
         "--checkpointing_steps",
         type=str,
@@ -224,7 +268,7 @@ def parse_args():
     parser.add_argument(
         "--report_to",
         type=str,
-        default="all",
+        default="tensorboard",
         help=(
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`,'
             ' `"wandb"`, `"comet_ml"` and `"clearml"`. Use `"all"` (default) to report to all integrations.'
@@ -261,16 +305,13 @@ def parse_args():
     parser.add_argument("--quantization_bit", type=str, default=None, help="quantization training")
     args = parser.parse_args()
     # Sanity checks
+
     if args.dataset_name is None and args.train_file is None and args.validation_file is None:
         raise ValueError("Need either a dataset name or a training/validation file.")
     else:
         if args.train_file is not None:
             extension = args.train_file.split(".")[-1]
-            assert extension in [
-                "csv",
-                "json",
-                "txt",
-            ], "`train_file` should be a csv, json or txt file."
+            assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, json or txt file."
         if args.validation_file is not None:
             extension = args.validation_file.split(".")[-1]
             assert extension in [
@@ -290,6 +331,7 @@ def main():
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
     # in the environment
+
     accelerator_log_kwargs = {}
     if args.with_tracking:
         if args.report_to == "tensorboard":
@@ -300,7 +342,6 @@ def main():
             accelerator_log_kwargs["log_with"] = tensorboard
         else:
             accelerator_log_kwargs["log_with"] = args.report_to
-        # accelerator_log_kwargs["logging_dir"] = args.output_dir
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -312,6 +353,7 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
@@ -326,6 +368,7 @@ def main():
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+
     accelerator.wait_for_everyone()
 
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
@@ -517,10 +560,6 @@ def main():
     # logger.info("using fp16")
     # model = model.half()
 
-    prefix = """命名实体识别：抽取文本中的 品牌，品类，系列型号 这三类命名实体，并按照json格式返回结果。\n\n"""
-
-    logger.info(f" prefix={prefix}")
-
     def preprocessing_function_train(examples):
         max_seq_length = args.max_source_length + args.max_target_length + 1
         # 添加EOS
@@ -531,17 +570,17 @@ def main():
         }
 
         # __import__('pdb').set_trace()
-        for i in range(len(examples["context"])):
-            if examples["context"][i] and examples["ner"][i]:
-                query, answer = examples["context"][i], examples["ner"][i]
-                answer = str(answer)
-                prompt = prefix + query + " ->"
+        for i in range(len(examples["input"])):
+            if examples["input"][i] and examples["output"][i] and examples["instruction"]:
+                inputs, outputs, instruction = examples["input"][i], examples["output"][i], examples["instruction"][i]
+                outputs = str(outputs)
+                prompt = instruction + inputs + " ->"
 
                 a_ids = tokenizer.encode(
                     text=prompt, add_special_tokens=True, truncation=True, max_length=args.max_source_length
                 )
                 b_ids = tokenizer.encode(
-                    text=answer, add_special_tokens=False, truncation=True, max_length=args.max_target_length
+                    text=outputs, add_special_tokens=False, truncation=True, max_length=args.max_target_length
                 )
 
                 context_length = len(a_ids)
@@ -565,19 +604,19 @@ def main():
         return model_inputs
 
     def preprocessing_function_eval(examples):
-        inputs, targets = [], []
-        for i in range(len(examples["context"])):
-            if examples["context"][i] and examples["ner"][i]:
-                query = examples["context"][i]
-                inputs.append(query)
-                target = str(examples["ner"][i])  # 需要将字典类型转化为字符串类型
+        sources, targets = [], []
+        for i in range(len(examples["input"])):
+            if examples["input"][i] and examples["output"][i] and examples["instruction"][i]:
+                inputs = examples["input"][i]
+                instruction = examples["instruction"][i]
+                inputs = instruction + inputs + "->"
+                sources.append(inputs)
+                target = str(examples["output"][i])  # 需要将字典类型转化为字符串类型
                 targets.append(target)
-
-        inputs = [prefix + inp + "->" for inp in inputs]
 
         tokenizer.pad_token_id = model.generation_config.pad_token_id
         model_inputs = tokenizer(
-            inputs,
+            sources,
             max_length=args.max_source_length,
             truncation=True,
             padding=True,
@@ -632,6 +671,7 @@ def main():
         collate_fn=default_data_collator,
         batch_size=args.per_device_eval_batch_size,
     )
+
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
     no_decay = ["bias", "layer_norm.weight"]
@@ -669,9 +709,14 @@ def main():
         lr_scheduler,
     ) = accelerator.prepare(model, optimizer, train_dataloader, eval_dataloader, lr_scheduler)
 
-    # accelerator.print(model)
+    accelerator.print(model)
+
     for name, paramas in model.named_parameters():
         accelerator.print(f"{name}==torch type={paramas.dtype}")
+
+    # is_ds_zero_3 = False
+    # if getattr(accelerator.state, "deepspeed_plugin", None):
+    #     is_ds_zero_3 = accelerator.state.deepspeed_plugin.zero_stage == 3
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -691,7 +736,9 @@ def main():
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("clm_no_trainer", experiment_config)
+
+        run = os.path.split(__file__)[-1].split(".")[0]
+        accelerator.init_trackers(run, experiment_config)
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -736,45 +783,56 @@ def main():
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
     for epoch in range(starting_epoch, args.num_train_epochs):
-        model.train()
-        if args.with_tracking:
-            total_loss = 0
-        for step, batch in enumerate(train_dataloader):
-            # We need to skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == starting_epoch:
-                if resume_step is not None and step < resume_step:
-                    if step % args.gradient_accumulation_steps == 0:
-                        progress_bar.update(1)
-                        completed_steps += 1
-                    continue
+        with TorchTracemalloc() as tracemalloc:
+            model.train()
+            if args.with_tracking:
+                total_loss = 0
+            for step, batch in enumerate(train_dataloader):
+                # We need to skip steps until we reach the resumed step
+                if args.resume_from_checkpoint and epoch == starting_epoch:
+                    if resume_step is not None and step < resume_step:
+                        if step % args.gradient_accumulation_steps == 0:
+                            progress_bar.update(1)
+                            completed_steps += 1
+                        continue
 
-            with accelerator.accumulate(model):
-                outputs = model(**batch)
-                loss = outputs.loss
-                # We keep track of the loss at each epoch
+                with accelerator.accumulate(model):
+                    outputs = model(**batch)
+                    loss = outputs.loss
+                    # We keep track of the loss at each epoch
 
-                if args.with_tracking:
-                    total_loss += loss.detach().float()
-                accelerator.backward(loss)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    if args.with_tracking:
+                        total_loss += loss.detach().float()
+                    accelerator.backward(loss)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
-                if args.with_tracking:
-                    accelerator.log({"train_loss": loss}, step=step)
+                    if args.with_tracking:
+                        accelerator.log({"train_loss": loss}, step=step)
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                completed_steps += 1
-            if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0:
-                    output_dir = f"step_{completed_steps }"
-                    if args.output_dir is not None:
-                        output_dir = os.path.join(args.output_dir, output_dir)
-                    accelerator.save_state(output_dir)
-            if completed_steps >= args.max_train_steps:
-                break
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    completed_steps += 1
+                if isinstance(checkpointing_steps, int):
+                    if completed_steps % checkpointing_steps == 0:
+                        output_dir = f"step_{completed_steps }"
+                        if args.output_dir is not None:
+                            output_dir = os.path.join(args.output_dir, output_dir)
+                        accelerator.save_state(output_dir)
+                if completed_steps >= args.max_train_steps:
+                    break
+
+            # Printing the GPU memory usage details such as allocated memory, peak memory, and total memory usage
+            accelerator.print("GPU Memory before entering the train : {}".format(b2mb(tracemalloc.begin)))
+            accelerator.print("GPU Memory consumed at the end of the train (end-begin): {}".format(tracemalloc.used))
+            accelerator.print("GPU Peak Memory consumed during the train (max-begin): {}".format(tracemalloc.peaked))
+            accelerator.print(
+                "GPU Total Peak Memory consumed during the train (max): {}".format(
+                    tracemalloc.peaked + b2mb(tracemalloc.begin)
+                )
+            )
 
         # 每个epoch 验证一次
         model.eval()
