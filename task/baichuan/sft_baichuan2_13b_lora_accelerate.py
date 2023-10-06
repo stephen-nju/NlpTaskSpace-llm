@@ -1,4 +1,5 @@
 """
+lora 微调的代码
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
@@ -18,7 +19,7 @@ import psutil
 import torch
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import DummyOptim, DummyScheduler, set_seed
 from datasets import load_dataset
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from torch.utils.data import DataLoader
@@ -42,63 +43,12 @@ from transformers.utils import (
 )
 
 # WLoraConfioill error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.29.2")
+check_min_version("4.32.2")
 
 logger = get_logger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-
-
-def b2mb(x):
-    # 字节转化
-    return int(x / 2**20)
-
-
-# def b2gb(x):
-#     return int(x/2**30)
-
-
-class TorchTracemalloc:
-    def __enter__(self):
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_max_memory_allocated()  # reset the peak gauge to zero_grad
-        self.begin = torch.cuda.memory_allocated()
-        self.process = psutil.Process()
-        self.cpu_begin = self.cpu_mem_used()
-        self.peak_monitoring = True
-        peak_monitor_thread = threading.Thread(target=self.peak_monitor_func)
-        peak_monitor_thread.daemon = True
-        peak_monitor_thread.start()
-        return self
-
-    def cpu_mem_used(self):
-        """get resident set size memory for the current process"""
-        return self.process.memeory_info().rss
-
-    def peak_monitor_func(self):
-        self.cpu_peak = -1
-        while True:
-            self.cpu_peak = max(self.cpu_mem_used(), self.cpu_peak)
-
-            # can't sleep or will not catch the peak right (this comment is here on purpose)
-            # time.sleep(0.001) # 1msec
-            if not self.peak_monitoring:
-                break
-
-    def __exit__(self, *exc):
-        self.peak_monitoring = False
-        gc.collect()
-        torch.cuda.empty_cache()
-        self.end = torch.cuda.memory_allocated()
-        self.peak = torch.cuda.max_memory_allocated()
-        self.used = b2mb(self.end - self.begin)
-        self.peaked = b2mb(self.peak - self.begin)
-        self.cpu_end = self.cpu_mem_used()
-        self.cpu_used = b2mb(self.cpu_end - self.cpu_begin)
-        self.cpu_peaked = b2mb(self.cpu_peak - self.cpu_begin)
-        # print(f"delta used/peak {self.used:4d}/{self.peaked:4d}")'
 
 
 def parse_args():
@@ -347,6 +297,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         **accelerator_log_kwargs,
     )
+
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -499,13 +450,16 @@ def main():
 
     # accelerator.print(model)
     embedding_size = model.get_input_embeddings().weight.shape[0]
-    if len(tokenizer) > embedding_size:
-        model.resize_token_embeddings(len(tokenizer))
+
+    logger.info(f"**embedding_size ={embedding_size},len tokenizer={len(tokenizer)}")
+
+    # if len(tokenizer) > embedding_size:
+    #     model.resize_token_embeddings(len(tokenizer))
 
     # model setting and lora config
     # model.supports_gradient_checkpointing = True  #
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()
+    # model.gradient_checkpointing_enable()
+    # model.enable_input_require_grads()
 
     model.config.use_cache = False  # silence the warnings. Please re-enable for inference!the datasets
 
@@ -530,10 +484,11 @@ def main():
     if args.quantization_bit is not None:
         # 启用模型量化需要开启
         model = prepare_model_for_kbit_training(model)
-    else:
-        # 使用fp16 来训练模型
-        accelerator.print("no quantization_bit using fp16")
-        model = model.half()
+
+    # elif accelerator.state.deepspeed_plugin is None:
+    #     # 不使用deepspeed
+    #     accelerator.print("no quantization_bit using fp16")
+    #     model = model.half()
 
     # lora_modules = find_all_linear_names(model)
     # model = model.half()
@@ -656,8 +611,8 @@ def main():
         )
 
     # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 1):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+    # for index in random.sample(range(len(train_dataset)), 1):
+    #     logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
     # DataLoaders creation:
 
     train_dataloader = DataLoader(
@@ -686,20 +641,53 @@ def main():
         },
     ]
 
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    # New Code #
+    # Creates Dummy Optimizer if `optimizer` was specified in the config file else creates Adam optimizer
+
+    optimizer_cls = (
+        torch.optim.AdamW
+        if accelerator.state.deepspeed_plugin is None
+        or "optimizer" not in accelerator.state.deepspeed_plugin.deepspeed_config
+        else DummyOptim
+    )
+
+    optimizer = optimizer_cls(optimizer_grouped_parameters, lr=args.learning_rate)
+
+    # # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
+    # if accelerator.distributed_type == DistributedType.TPU:
+    #     model.tie_weights()
     # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
+
+    if accelerator.state.deepspeed_plugin is not None:
+        args.gradient_accumulation_steps = accelerator.state.deepspeed_plugin.deepspeed_config[
+            "gradient_accumulation_steps"
+        ]
+
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    overrode_max_train_steps = False
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
+    else:
+        args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-    )
+        # New Code #
+        # Creates Dummy Scheduler if `scheduler` was specified in the config file else creates `args.lr_scheduler_type` Scheduler
+    if (
+        accelerator.state.deepspeed_plugin is None
+        or "scheduler" not in accelerator.state.deepspeed_plugin.deepspeed_config
+    ):
+        lr_scheduler = get_scheduler(
+            name=args.lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=args.num_warmup_steps,
+            num_training_steps=args.max_train_steps,
+        )
+    else:
+        lr_scheduler = DummyScheduler(
+            optimizer, total_num_steps=args.max_train_steps, warmup_num_steps=args.num_warmup_steps
+        )
+
     # Prepare everything with our `accelerator`.
     (
         model,
@@ -714,14 +702,11 @@ def main():
     for name, paramas in model.named_parameters():
         accelerator.print(f"{name}==torch type={paramas.dtype}")
 
-    # is_ds_zero_3 = False
-    # if getattr(accelerator.state, "deepspeed_plugin", None):
-    #     is_ds_zero_3 = accelerator.state.deepspeed_plugin.zero_stage == 3
-
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
@@ -783,56 +768,56 @@ def main():
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
     for epoch in range(starting_epoch, args.num_train_epochs):
-        with TorchTracemalloc() as tracemalloc:
-            model.train()
-            if args.with_tracking:
-                total_loss = 0
-            for step, batch in enumerate(train_dataloader):
-                # We need to skip steps until we reach the resumed step
-                if args.resume_from_checkpoint and epoch == starting_epoch:
-                    if resume_step is not None and step < resume_step:
-                        if step % args.gradient_accumulation_steps == 0:
-                            progress_bar.update(1)
-                            completed_steps += 1
-                        continue
+        # with TorchTracemalloc() as tracemalloc:
+        model.train()
+        if args.with_tracking:
+            total_loss = 0
+        for step, batch in enumerate(train_dataloader):
+            # We need to skip steps until we reach the resumed step
+            if args.resume_from_checkpoint and epoch == starting_epoch:
+                if resume_step is not None and step < resume_step:
+                    if step % args.gradient_accumulation_steps == 0:
+                        progress_bar.update(1)
+                        completed_steps += 1
+                    continue
 
-                with accelerator.accumulate(model):
-                    outputs = model(**batch)
-                    loss = outputs.loss
-                    # We keep track of the loss at each epoch
+            with accelerator.accumulate(model):
+                outputs = model(**batch)
+                loss = outputs.loss
+                # We keep track of the loss at each epoch
 
-                    if args.with_tracking:
-                        total_loss += loss.detach().float()
-                    accelerator.backward(loss)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
+                if args.with_tracking:
+                    total_loss += loss.detach().float()
+                accelerator.backward(loss)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
 
-                    if args.with_tracking:
-                        accelerator.log({"train_loss": loss}, step=step)
+                if args.with_tracking:
+                    accelerator.log({"train_loss": loss}, step=step)
 
-                # Checks if the accelerator has performed an optimization step behind the scenes
-                if accelerator.sync_gradients:
-                    progress_bar.update(1)
-                    completed_steps += 1
-                if isinstance(checkpointing_steps, int):
-                    if completed_steps % checkpointing_steps == 0:
-                        output_dir = f"step_{completed_steps }"
-                        if args.output_dir is not None:
-                            output_dir = os.path.join(args.output_dir, output_dir)
-                        accelerator.save_state(output_dir)
-                if completed_steps >= args.max_train_steps:
-                    break
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                completed_steps += 1
 
-            # Printing the GPU memory usage details such as allocated memory, peak memory, and total memory usage
-            accelerator.print("GPU Memory before entering the train : {}".format(b2mb(tracemalloc.begin)))
-            accelerator.print("GPU Memory consumed at the end of the train (end-begin): {}".format(tracemalloc.used))
-            accelerator.print("GPU Peak Memory consumed during the train (max-begin): {}".format(tracemalloc.peaked))
-            accelerator.print(
-                "GPU Total Peak Memory consumed during the train (max): {}".format(
-                    tracemalloc.peaked + b2mb(tracemalloc.begin)
-                )
-            )
+            if isinstance(checkpointing_steps, int):
+                if completed_steps % checkpointing_steps == 0:
+                    output_dir = f"step_{completed_steps }"
+                    if args.output_dir is not None:
+                        output_dir = os.path.join(args.output_dir, output_dir)
+                    accelerator.save_state(output_dir)
+            if completed_steps >= args.max_train_steps:
+                break
+
+        # Printing the GPU memory usage details such as allocated memory, peak memory, and total memory usage
+        # accelerator.print("GPU Memory before entering the train : {}".format(b2mb(tracemalloc.begin)))
+        # accelerator.print("GPU Memory consumed at the end of the train (end-begin): {}".format(tracemalloc.used))
+        # accelerator.print("GPU Peak Memory consumed during the train (max-begin): {}".format(tracemalloc.peaked))
+        # accelerator.print(
+        #     "GPU Total Peak Memory consumed during the train (max): {}".format(
+        #         tracemalloc.peaked + b2mb(tracemalloc.begin)
+        #     )
 
         # 每个epoch 验证一次
         model.eval()
@@ -880,6 +865,7 @@ def main():
             args.output_dir,
             is_main_process=accelerator.is_main_process,
             save_function=accelerator.save,
+            state_dict=accelerator.get_state_dict(model),
         )
 
         if accelerator.is_main_process:

@@ -1,26 +1,22 @@
 import argparse
 import json
 
-import numpy as np
 import torch
 from datasets import load_dataset
+from metric_utils import report_metric
 from peft import PeftModel
 from tqdm import tqdm
 
-from metrics.ner import report_metric
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
 )
 
 
-key_name_map = {"品牌": "HP", "品类": "HC", "系列型号": "XL"}
-
-
 def parse_argument():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str, required=True, help="model name or path")
-    parser.add_argument("--lora_ckpt_path", type=str, required=True, help="model name or path")
+    parser.add_argument("--lora_ckpt_path", type=str, default=None, help="model name or path")
     parser.add_argument("--dev_data", type=str, help="dev data path")
     parser.add_argument("--output_dir", type=str, default="ceval_output", help="output directory")
     return parser.parse_args()
@@ -33,37 +29,26 @@ def postprocess_outputdata(output_data):
     # gt ground_truth
     target = output_data[1]
     if isinstance(gt, str):
-        gt_dict = json.loads(gt)
-    elif isinstance(gt, dict):
-        gt_dict = gt
+        gt_list = json.loads(gt)
+    elif isinstance(gt, list):
+        gt_list = gt
     else:
         return res_gt, res_tg
 
-    for k, v in gt_dict.items():
-        if k in key_name_map:
-            name = key_name_map[k]
-            for tv in v:
-                res_gt.append({"type": name, "span": tv, "start": None, "end": None})
+    for v in gt_list:
+        res_gt.append({"type": v["type"], "span": v["span"], "start": None, "end": None})
 
     # 解析target数据，输入与输出有特殊分割符
-    tg = target.split(" ->")[-1]
+    tg = target.split("->")[-1]
     try:
-        tg_dict = eval(tg)
+        tg_list = eval(tg)
     except:
         return res_gt, res_tg
-    if isinstance(tg_dict, dict):
-        for k, v in tg_dict.items():
-            if k in key_name_map:
-                type_name = key_name_map[k]
-                if v is None:
-                    continue
-                if isinstance(v, list):
-                    for tv in v:
-                        res_tg.append({"type": type_name, "span": tv, "start": None, "end": None})
-                elif isinstance(v, str):
-                    res_tg.append({"type": type_name, "span": v, "start": None, "end": None})
-                else:
-                    continue
+
+    if isinstance(tg_list, list):
+        for v in tg_list:
+            if "type" in v.keys() and "span" in v.keys():
+                res_tg.append({"type": v["type"], "span": v["span"], "start": None, "end": None})
 
     return res_gt, res_tg
 
@@ -86,12 +71,11 @@ def main():
         padding_side="left",
     )
 
-    peft_model = PeftModel.from_pretrained(model, args.lora_ckpt_path)
-    model = peft_model.merge_and_unload()
+    if args.lora_ckpt_path is not None:
+        peft_model = PeftModel.from_pretrained(model, args.lora_ckpt_path)
+        model = peft_model.merge_and_unload()
 
     ################处理数据#########################################
-
-    prefix = """命名实体识别：抽取文本中的 品牌，品类，系列型号 这三类命名实体，并按照json格式返回结果。\n\n"""
 
     eval_data = []
     with open(args.dev_data, "r", encoding="utf-8") as g:
@@ -105,19 +89,20 @@ def main():
     for data in tqdm(eval_data):
         # if index > 10:
         #     break
-        inp = data["context"]
-        inputs = prefix + inp + " ->"
+        instruct = data["instruct"]
+        inp = data["input"]
+        inputs = instruct + inp + " ->"
         input_ids = tokenizer.encode(inputs, return_tensors="pt").cuda()
         output = model.generate(
             input_ids,
-            max_new_tokens=64,
+            max_new_tokens=128,
             return_dict_in_generate=True,
             repetition_penalty=1.1,
         )
         output_text = tokenizer.decode(
             output.sequences[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
-        gt, tg = postprocess_outputdata([data["ner"], output_text])
+        gt, tg = postprocess_outputdata([data["output"], output_text])
         output_data.append({"ground_truth": gt, "baichuan": tg})
 
     input_dict = {"data": output_data, "total": len(output_data)}

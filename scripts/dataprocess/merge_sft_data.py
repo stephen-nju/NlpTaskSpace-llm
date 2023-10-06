@@ -31,20 +31,38 @@ for n in data:
     o = {}
     o["instruction"] = str(n["instruction"])
     o["input"] = str(n["input"])
-    o["output"] = str(n["output"])
+    output = n["output"]
+    n_output = []
+    for out in output:
+        n = {}
+        for k, v in out.items():
+            n[k] = str(v)
+        n_output.append(n)
+    o["output"] = n_output
+
     data_formated.append(o)
 
-np.random.shuffle(data_formated)
-rate = 0.8
-index = math.ceil(rate * len(data_formated))
+# performance test dataset
+# with open("/home/zb/train_data/performance_test/train.json", "w", encoding="utf-8") as g:
+#     for a in data_formated[:10000]:
+#         g.write(json.dumps(a, ensure_ascii=False) + "\n")
 
-train = data_formated[:index]
-test = data_formated[index:]
+# with open("/home/zb/train_data/performance_test/dev.json", "w", encoding="utf-8") as g:
+#     for a in data_formated[:1000]:
+#         g.write(json.dumps(a, ensure_ascii=False) + "\n")
 
-with open("/home/zb/train_data/baichuan_sft/train.json", "w", encoding="utf-8") as g:
-    for d in train:
-        g.write(json.dumps(d, ensure_ascii=False) + "\n")
 
-with open("/home/zb/train_data/baichuan_sft/dev.json", "w", encoding="utf-8") as g:
-    for d in test:
-        g.write(json.dumps(d, ensure_ascii=False) + "\n")
+# np.random.shuffle(data_formated)
+# rate = 0.8
+# index = math.ceil(rate * len(data_formated))
+
+# train = data_formated[:index]
+# test = data_formated[index:]
+
+# with open("/home/zb/train_data/baichuan_sft/train.json", "w", encoding="utf-8") as g:
+#     for d in train:
+#         g.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+# with open("/home/zb/train_data/baichuan_sft/dev.json", "w", encoding="utf-8") as g:
+#     for d in test:
+#         g.write(json.dumps(d, ensure_ascii=False) + "\n")
