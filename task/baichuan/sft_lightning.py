@@ -8,14 +8,17 @@ from functools import partial
 from os import cpu_count
 
 import bitsandbytes as bnb
+import deepspeed
 import torch
 import torch.nn as nn
+from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning import (
     LightningDataModule,
     LightningModule,
     Trainer,
     seed_everything,
 )
+from lightning.strategies import DeepSpeedStrategy
 from multiprocess.dummy import Pool
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from torch.utils.data import DataLoader, Dataset
@@ -27,16 +30,16 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     get_linear_schedule_with_warmup,
+    get_polynomial_decay_schedule_with_warmup,
 )
 
-
-class Baichuan7bNerInputExample:
+class BaichuanInputExampel:
     def __init__(self, text, labels) -> None:
         self.text = text
         self.labels = labels
 
 
-class Baichuan7bNerInputFeature:
+class BaichuanInputFeature:
     def __init__(self, input_ids, labels) -> None:
         self.input_ids = input_ids
         self.labels = labels
@@ -74,7 +77,7 @@ def convert_example_to_feature(example, tokenizer, max_source_length, max_target
     # if args.ignore_pad_token_for_loss:
     labels = [(l if l != pad_token_id else -100) for l in labels]
 
-    return Baichuan7bNerInputFeature(input_ids=input_ids, labels=labels)
+    return BaichuanInputFeature(input_ids=input_ids, labels=labels)
 
 
 def convert_examples_to_features(
@@ -100,7 +103,7 @@ def convert_examples_to_features(
     return features
 
 
-class Baichuan7bNerDataset(Dataset):
+class BaichuanDataset(Dataset):
     def __init__(self, features) -> None:
         self.features = features
         super().__init__()
@@ -117,10 +120,10 @@ class Baichuan7bNerDataset(Dataset):
         }
 
 
-class Baichuan7bNerDataModule(LightningDataModule):
+class BaichuanDataModule(LightningDataModule):
     def __init__(self, args) -> None:
         self.args = args
-        config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+        self.config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(
             args.model_name_or_path,
             use_fast=not args.use_slow_tokenizer,
@@ -163,7 +166,7 @@ class Baichuan7bNerDataModule(LightningDataModule):
         with open(path, "r", encoding="utf-8") as g:
             for line in g:
                 data = json.loads(line)
-                yield Baichuan7bNerInputExample(text=data["context"], labels=data["ner"])
+                yield BaichuanInputExampel(text=data["context"], labels=data["ner"])
 
     def setup(self, stage: str) -> None:
         with open(os.path.join(self.cache_path, "train_feature.pkl"), "rb") as g:
@@ -174,7 +177,7 @@ class Baichuan7bNerDataModule(LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(
-            dataset=Baichuan7bNerDataset(self.train_features),
+            dataset=BaichuanDataset(self.train_features),
             batch_size=self.args.batch_size,
             num_workers=4,
             pin_memory=True,
@@ -189,7 +192,7 @@ class Baichuan7bNerDataModule(LightningDataModule):
 #                        )
 
 
-class Baichuan7bNerModule(LightningModule):
+class BaichuanModule(LightningModule):
     def __init__(self, args):
         super().__init__()
         self.args = args
@@ -205,7 +208,7 @@ class Baichuan7bNerModule(LightningModule):
             # device_map="auto",
         )
         # 模型初始化
-        embedding_size = self.model.get_input_embeddings().weight.shape[0]
+        # embedding_size = self.model.get_input_embeddings().weight.shape[0]
         # if len(tokenizer) > embedding_size:
         #     self.model.resize_token_embeddings(len(tokenizer))
 
@@ -220,7 +223,8 @@ class Baichuan7bNerModule(LightningModule):
         # 配置LoraConfig
         if args.quantization_bit is not None:
             print(f"Quantized to {args.quantization_bit} bit")
-            model = model.quantize(args.quantization_bit)
+            self.model = self.model.quantize(args.quantization_bit)
+
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             target_modules=["W_pack"],
@@ -236,34 +240,25 @@ class Baichuan7bNerModule(LightningModule):
         self.model.print_trainable_parameters()
         self.save_hyperparameters()
 
-    def configure_optimizers(self):
-        """Prepare optimizer and learning rate scheduler"""
+    def deepspeed_offload(self) -> bool:
+        strategy = self.trainer.strategy
+        if isinstance(strategy, DeepSpeedStrategy):
+            config = strategy.config["zero_optimization"]
+            return config.get("offload_optimizer") or config.get("offload_param")
+        return False
 
-        no_decay = ["bias", "layer_norm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                "weight_decay": self.args.weight_decay,
-            },
-            {
-                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-                "weight_decay": 0.0,
-            },
+    def configure_optimizers(self):
+        no_decay = ["bias", "LayerNorm.weight"]
+        params_decay = [p for n, p in self.named_parameters() if not any(nd in n for nd in no_decay)]
+        params_nodecay = [p for n, p in self.named_parameters() if any(nd in n for nd in no_decay)]
+        optim_groups = [
+            {"params": params_decay, "weight_decay": self.hparams.weight_decay},
+            {"params": params_nodecay, "weight_decay": 0.0},
         ]
-        if self.args.optimizer == "adam":
-            optimizer = torch.optim.Adam(
-                optimizer_grouped_parameters,
-                lr=self.args.learning_rate,
-            )
-        else:
-            # revisiting few-sample BERT Fine-tuning https://arxiv.org/pdf/2006.05987.pdf
-            # https://github.com/asappresearch/revisit-bert-finetuning/blob/master/run_glue.py
-            optimizer = torch.optim.AdamW(
-                optimizer_grouped_parameters,
-                lr=self.args.learning_rate,
-                eps=self.args.adam_epsilon,
-                weight_decay=self.args.weight_decay,
-            )
+
+        if self.deepspeed_offload:
+            optimizer = DeepSpeedCPUAdam(optim_groups, lr=self.args.learning_rate, betas=self.args.betas)
+        optimizer = torch.optim.AdamW(optim_groups, lr=self.args.learning_rate, betas=self.args.betas)
 
         num_gpus = self.trainer.num_devices
         # 注：只有在使用pytorch Lightning的LightningDataModule 时候才可以使用该方式回去训练集大小
@@ -320,7 +315,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_data", type=str, default="", help="test data path")
     parser.add_argument("--dev_data", type=str, default="", help="dev data path")
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
-    
+
     parser.add_argument(
         "--lr_scheduler",
         choices=["linear", "onecycle", "polydecay", "cawr"],
@@ -487,13 +482,10 @@ if __name__ == "__main__":
 
     arg = parser.parse_args()
 
-
-    
     if arg.seed is not None:
         seed_everything(arg.seed)
 
-    datamodule = Baichuan7bNerDataModule(arg)
-    model = Baichuan7bNerModule(arg)
-
-    trainer = Trainer(accelerator="gpu", strategy="ddp", devices=1, max_epochs=arg.max_epochs)
-    trainer.fit(model, datamodule=datamodule)
+    # datamodule = Baichuan7bNerDataModule(arg)
+    # model = Baichuan7bNerModule(arg)
+    # trainer = Trainer(accelerator="gpu", strategy="ddp", devices=1, max_epochs=arg.max_epochs)
+    # trainer.fit(model, datamodule=datamodule)

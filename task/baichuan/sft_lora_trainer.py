@@ -2,23 +2,30 @@
 百川lora微调代码
 
 """
+import json
 import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import bitsandbytes as bnb
+import jieba
+import numpy as np
 import torch
+import torch.nn as nn
 from datasets import load_dataset
+from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from peft import (
     LoraConfig,
     TaskType,
     get_peft_model,
     prepare_model_for_kbit_training,
 )
+from rouge_chinese import Rouge
 
 import transformers
+from llm.src.constant import IGNORE_INDEX
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -27,6 +34,7 @@ from transformers import (
     DataCollatorForSeq2Seq,
     HfArgumentParser,
     Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
     Trainer,
     TrainingArguments,
     set_seed,
@@ -34,7 +42,73 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 
+if TYPE_CHECKING:
+    from transformers.tokenization_utils import PreTrainedTokenizer
+    from transformers.trainer import PredictionOutput
+
+
 logger = logging.getLogger()
+
+
+@dataclass
+class ComputeMetrics:
+    tokenizer: "PreTrainedTokenizer"
+
+    def __call__(self, eval_preds: Sequence[Union[np.ndarray, Tuple[np.ndarray]]]) -> Dict[str, float]:
+        r"""
+        Uses the model predictions to compute metrics.
+        """
+        preds, labels = eval_preds
+        score_dict = {"rouge-1": [], "rouge-2": [], "rouge-l": [], "bleu-4": []}
+        preds = np.where(preds != IGNORE_INDEX, preds, self.tokenizer.pad_token_id)
+        labels = np.where(labels != IGNORE_INDEX, labels, self.tokenizer.pad_token_id)
+        decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True)
+        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        for pred, label in zip(decoded_preds, decoded_labels):
+            hypothesis = list(jieba.cut(pred))
+            reference = list(jieba.cut(label))
+            if len(" ".join(hypothesis).split()) == 0 or len(" ".join(reference).split()) == 0:
+                result = {"rouge-1": {"f": 0.0}, "rouge-2": {"f": 0.0}, "rouge-l": {"f": 0.0}}
+            else:
+                rouge = Rouge()
+                scores = rouge.get_scores(" ".join(hypothesis), " ".join(reference))
+                result = scores[0]
+
+            for k, v in result.items():
+                score_dict[k].append(round(v["f"] * 100, 4))
+            bleu_score = sentence_bleu([list(label)], list(pred), smoothing_function=SmoothingFunction().method3)
+            score_dict["bleu-4"].append(round(bleu_score * 100, 4))
+
+        return {k: float(np.mean(v)) for k, v in score_dict.items()}
+
+
+class SftTrainer(Seq2SeqTrainer):
+    def save_predictions(self, predict_results: "PredictionOutput") -> None:
+        r"""
+        Saves model predictions to `output_dir`.
+        A custom behavior that not contained in Seq2SeqTrainer.
+        """
+
+        if not self.is_world_process_zero():
+            return
+
+        output_prediction_file = os.path.join(self.args.output_dir, "generated_predictions.jsonl")
+        logger.info(f"Saving prediction results to {output_prediction_file}")
+        preds = np.where(
+            predict_results.predictions != IGNORE_INDEX, predict_results.predictions, self.tokenizer.pad_token_id
+        )
+        labels = np.where(
+            predict_results.label_ids != IGNORE_INDEX, predict_results.label_ids, self.tokenizer.pad_token_id
+        )
+        decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+        decoded_labels = self.tokenizer.batch_decode(
+            labels, skip_special_tokens=True, clean_up_tokenization_spaces=True
+        )
+        with open(output_prediction_file, "w", encoding="utf-8") as writer:
+            res: List[str] = []
+            for pred, label in zip(decoded_preds, decoded_labels):
+                res.append(json.dumps({"label": label, "predict": pred}, ensure_ascii=False))
+            writer.write("\n".join(res))
 
 
 @dataclass
@@ -197,7 +271,9 @@ class FinetuneArguments:
             )
         },
     )
+
     use_lora: bool = field(default=True)
+
     lora_rank: Optional[int] = field(default=8, metadata={"help": "The intrinsic dimension for LoRA fine-tuning."})
     lora_alpha: Optional[float] = field(
         default=32.0, metadata={"help": "The scale factor for LoRA fine-tuning (similar with the learning rate)."}
@@ -249,7 +325,7 @@ class FinetuneArguments:
 
 def main():
     finetune_args, training_args = HfArgumentParser(
-        (FinetuneArguments, TrainingArguments)
+        (FinetuneArguments, Seq2SeqTrainingArguments)
     ).parse_args_into_dataclasses()
 
     #############logging prepare ########################
@@ -278,6 +354,9 @@ def main():
         + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
+    # 参数合规性检查,参考LLaMA-Efficient-Tuning
+    if training_args.do_train and training_args.predict_with_generate:
+        raise ValueError("`predict_with_generate` cannot be set as True while training.")
 
     #######检测checkpoint
     last_checkpoint = None
@@ -301,7 +380,9 @@ def main():
     config = AutoConfig.from_pretrained(finetune_args.model_name_or_path, trust_remote_code=True)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        finetune_args.model_name_or_path, use_fast=finetune_args.use_fast_tokenizer, trust_remote_code=True
+        finetune_args.model_name_or_path,
+        use_fast=finetune_args.use_fast_tokenizer,
+        trust_remote_code=True,
     )
 
     if finetune_args.quantization_bit is not None:
@@ -334,7 +415,6 @@ def main():
             config=config,
             trust_remote_code=True,
         )
-
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
 
@@ -376,6 +456,8 @@ def main():
         model.print_trainable_parameters()
 
     tokenizer.pad_token_id = model.generation_config.pad_token_id
+    if training_args.predict_with_generate:
+        tokenizer.padding_side = "left"
     ############# prepare data ###########
 
     data_files = {}
@@ -451,6 +533,7 @@ def main():
                 pad_len = max_seq_length - len(input_ids)
                 input_ids = input_ids + [model.generation_config.pad_token_id] * pad_len
                 labels = labels + [model.generation_config.pad_token_id] * pad_len
+
                 if finetune_args.ignore_pad_token_for_loss:
                     labels = [(l if l != model.generation_config.pad_token_id else -100) for l in labels]
 
@@ -460,6 +543,8 @@ def main():
         return model_inputs
 
     def preprocessing_function_eval(examples):
+        tokenizer.padding_side = "left"
+
         sources, targets = [], []
         for i in range(len(examples["input"])):
             if examples["input"][i] and examples["output"][i] and examples["instruction"][i]:
@@ -547,21 +632,29 @@ def main():
     #         score_dict[k] = float(np.mean(v))
     #     return score_dict
 
-    # Override the decoding parameters of Seq2SeqTrainer
+    # 重新更新生成的相关参数
     # training_args.generation_max_length = (
     #     training_args.generation_max_length
-    #     if training_args.generation_max_length is not None else
-    #     data_args.val_max_target_length)
-    # training_args.generation_num_beams = (data_args.num_beams if
-    #                                       data_args.num_beams is not None else
-    #                                       training_args.generation_num_beams)
+    #     if training_args.generation_max_length is not None
+    #     else finetune_args.val_max_target_length
+    # )
+    # training_args.generation_num_beams = (
+    #     finetune_args.num_beams if finetune_args.num_beams is not None else training_args.generation_num_beams
+    # )
 
-    trainer = Trainer(
+    trainer = SftTrainer(
         model=model,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         args=training_args,
-        data_collator=DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True),
+        data_collator=DataCollatorForSeq2Seq(
+            tokenizer,
+            label_pad_token_id=IGNORE_INDEX if finetune_args.ignore_pad_token_for_loss else tokenizer.pad_token_id,
+            pad_to_multiple_of=8,
+            return_tensors="pt",
+            padding=True,
+        ),
+        compute_metrics=ComputeMetrics(tokenizer) if training_args.predict_with_generate else None,
     )
 
     if training_args.do_train:
@@ -572,7 +665,6 @@ def main():
             checkpoint = last_checkpoint
 
         train_output = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model()
 
         metrics = train_output.metrics
         max_train_samples = (
@@ -582,14 +674,26 @@ def main():
 
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
-        trainer.save_state()
+        trainer.save_model()
 
-    # # Evaluation
-    # if training_args.do_eval:
-    #     logger.info("*** Evaluate ***")
-    #     metrics = trainer.evaluate(metric_key_prefix="eval", do_sample=True, top_p=0.7, max_length=64, temperature=0.95)
-    #     trainer.log_metrics("eval", metrics)
-    #     trainer.save_metrics("eval", metrics)
+        # if trainer.is_world_process_zero():
+        #     logger.info(f"Saving model checkpoint to {training_args.output_dir}")
+        #     if is_deepspeed_zero3_enabled():
+        #         save_model_zero3(model, tokenizer, training_args, trainer)
+        #     else:
+        #         save_model(model, tokenizer, training_args)
+
+    # Evaluation
+    if training_args.do_eval:
+        gen_kwarg = model.generation_config.to_dict()
+        logger.info("*** Evaluate ***")
+        # 可以自定义解码策略
+        # print(gen_kwarg)
+        metrics = trainer.evaluate(metric_key_prefix="eval", **gen_kwarg)
+        if training_args.predict_with_generate:  # eval_loss will be wrong if predict_with_generate is enabled
+            metrics.pop("eval_loss", None)
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
 
 
 if __name__ == "__main__":

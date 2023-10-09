@@ -16,9 +16,9 @@ from transformers import (
 def parse_argument():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str, required=True, help="model name or path")
+    parser.add_argument("--experiment_name", type=str, help="experiment name")
     parser.add_argument("--lora_ckpt_path", type=str, default=None, help="model name or path")
     parser.add_argument("--dev_data", type=str, help="dev data path")
-    parser.add_argument("--output_dir", type=str, default="ceval_output", help="output directory")
     return parser.parse_args()
 
 
@@ -85,11 +85,12 @@ def main():
             eval_data.append(data)
 
     output_data = []
-
+    raw_output = []
+    # eval_data = eval_data[:10]
     for data in tqdm(eval_data):
         # if index > 10:
         #     break
-        instruct = data["instruct"]
+        instruct = data["instruction"]
         inp = data["input"]
         inputs = instruct + inp + " ->"
         input_ids = tokenizer.encode(inputs, return_tensors="pt").cuda()
@@ -104,11 +105,13 @@ def main():
         )
         gt, tg = postprocess_outputdata([data["output"], output_text])
         output_data.append({"ground_truth": gt, "baichuan": tg})
+        raw_output.append(output_text)
 
     input_dict = {"data": output_data, "total": len(output_data)}
 
-    with open("output.json", "w", encoding="utf-8") as g:
-        json.dump(input_dict, g, ensure_ascii=False, indent=2)
+    with open(f"output/{args.experiment_name}.output.txt", "w", encoding="utf-8") as g:
+        for s in raw_output:
+            g.write(s + "\n")
 
     report_metric(input_dict)
 
