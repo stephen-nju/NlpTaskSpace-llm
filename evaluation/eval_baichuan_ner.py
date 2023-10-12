@@ -87,22 +87,28 @@ def main():
     output_data = []
     raw_output = []
     # eval_data = eval_data[:10]
-    for data in tqdm(eval_data):
+    for index, data in tqdm(enumerate(eval_data), total=len(eval_data)):
         # if index > 10:
         #     break
         instruct = data["instruction"]
         inp = data["input"]
         inputs = instruct + inp + " ->"
         input_ids = tokenizer.encode(inputs, return_tensors="pt").cuda()
-        output = model.generate(
-            input_ids,
-            max_new_tokens=128,
-            return_dict_in_generate=True,
-            repetition_penalty=1.1,
-        )
-        output_text = tokenizer.decode(
-            output.sequences[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
+        # output = model.generate(
+        #     input_ids,
+        #     max_new_tokens=128,
+        #     return_dict_in_generate=True,
+        #     repetition_penalty=1.1,
+        # )
+        # output_text = tokenizer.decode(
+        #     output.sequences[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
+        # )
+
+        output = model.generate(input_ids, max_new_tokens=128)
+
+        output_text = tokenizer.decode(output.cpu()[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        if index % 100 == 0:
+            print(output_text)
         gt, tg = postprocess_outputdata([data["output"], output_text])
         output_data.append({"ground_truth": gt, "baichuan": tg})
         raw_output.append(output_text)
@@ -116,5 +122,35 @@ def main():
     report_metric(input_dict)
 
 
+def evaluate():
+    data = []
+    output = []
+    with open("/data/SHARE/tmpt/sft_13b_lora_ner_epochs_20_eval_train_predictions.json", "r", encoding="utf-8") as g:
+        data = json.load(g)
+
+    for d in data:
+        # print(d)
+        input = eval(d["Input"])
+        groundtruth = input["output"]
+        try:
+            target = eval(d["Output"])
+        except:
+            target = []
+
+        tg = []
+        for target_dict in target:
+            flag = True
+            if isinstance(target_dict, dict):
+                if "type" not in target_dict.keys() or "span" not in target_dict.keys():
+                    flag = False
+            if flag:
+                tg.append(target_dict)
+
+        output.append({"ground_truth": groundtruth, "baichuan": tg})
+    input_dict = {"data": output, "total": len(output)}
+    # print(input_dict)
+    report_metric(input_dict)
+
+
 if __name__ == "__main__":
-    main()
+    evaluate()

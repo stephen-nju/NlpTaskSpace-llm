@@ -18,6 +18,7 @@ from datasets import load_dataset
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from peft import (
     LoraConfig,
+    PeftModel,
     TaskType,
     get_peft_model,
     prepare_model_for_kbit_training,
@@ -287,6 +288,11 @@ class FinetuneArguments:
         },
     )
 
+    lora_ckpt_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "lora checkpoint path for evaluate"},
+    )
+
     def __post_init__(self):
         if isinstance(self.lora_target, str):  # support custom target modules/layers of LoRA
             self.lora_target = [target.strip() for target in self.lora_target.split(",")]
@@ -377,87 +383,116 @@ def main():
 
     ####### prepare model ############
 
-    config = AutoConfig.from_pretrained(finetune_args.model_name_or_path, trust_remote_code=True)
+    if training_args.do_train and not training_args.do_eval:
+        # 模型只做训练的时候
+        config = AutoConfig.from_pretrained(finetune_args.model_name_or_path, trust_remote_code=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        finetune_args.model_name_or_path,
-        use_fast=finetune_args.use_fast_tokenizer,
-        trust_remote_code=True,
-    )
+        tokenizer = AutoTokenizer.from_pretrained(
+            finetune_args.model_name_or_path,
+            use_fast=finetune_args.use_fast_tokenizer,
+            trust_remote_code=True,
+        )
 
-    if finetune_args.quantization_bit is not None:
-        print(f"Quantized to {finetune_args.quantization_bit}")
-        if finetune_args.quantization_bit == "4bit":
-            # load_in_4bit = (True,)
-            quantization_config = BitsAndBytesConfig(
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
+        if finetune_args.quantization_bit is not None:
+            print(f"Quantized to {finetune_args.quantization_bit}")
+            if finetune_args.quantization_bit == "4bit":
+                # load_in_4bit = (True,)
+                quantization_config = BitsAndBytesConfig(
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+            elif finetune_args.quantization_bit == "8bit":
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+            else:
+                raise ValueError("unsupport quantization_bit")
+
+            model = AutoModelForCausalLM.from_pretrained(
+                finetune_args.model_name_or_path,
+                from_tf=bool(".ckpt" in finetune_args.model_name_or_path),
+                config=config,
+                quantization_config=quantization_config,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
             )
-        elif finetune_args.quantization_bit == "8bit":
-            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+
         else:
-            raise ValueError("unsupport quantization_bit")
+            model = AutoModelForCausalLM.from_pretrained(
+                finetune_args.model_name_or_path,
+                from_tf=bool(".ckpt" in finetune_args.model_name_or_path),
+                config=config,
+                trust_remote_code=True,
+            )
+        # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
+        # on a small vocab and want a smaller embedding size, remove this test.
 
-        model = AutoModelForCausalLM.from_pretrained(
-            finetune_args.model_name_or_path,
-            from_tf=bool(".ckpt" in finetune_args.model_name_or_path),
-            config=config,
-            quantization_config=quantization_config,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
+        # embedding_size = model.get_input_embeddings().weight.shape[0]
+        # if len(tokenizer) > embedding_size:
+        #     model.resize_token_embeddings(len(tokenizer))
 
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            finetune_args.model_name_or_path,
-            from_tf=bool(".ckpt" in finetune_args.model_name_or_path),
-            config=config,
-            trust_remote_code=True,
-        )
-    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
+        # model.supports_gradient_checkpointing = True  #
 
-    # embedding_size = model.get_input_embeddings().weight.shape[0]
-    # if len(tokenizer) > embedding_size:
-    #     model.resize_token_embeddings(len(tokenizer))
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
 
-    # model.supports_gradient_checkpointing = True  #
-
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()
-
-    model.config.use_cache = False  # silence the warnings. Please re-enable for inference!the datasets
-
-    # 分布式训练
-    model.is_parallelizable = True
-    model.model_parallel = True
-
-    if finetune_args.quantization_bit is not None:
-        # 启用模型量化需要开启
-        model = prepare_model_for_kbit_training(model)
-
-    if finetune_args.use_lora:
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            target_modules=finetune_args.lora_target,
-            inference_mode=False,
-            r=finetune_args.lora_rank,
-            lora_alpha=finetune_args.lora_alpha,
-            lora_dropout=finetune_args.lora_dropout,
-        )
-        # adalora 会出现 https://github.com/huggingface/peft/issues/479
-
-        model = get_peft_model(model, peft_config)
+        model.config.use_cache = False  # silence the warnings. Please re-enable for inference!the datasets
 
         # 分布式训练
         model.is_parallelizable = True
         model.model_parallel = True
-        model.print_trainable_parameters()
+
+        if finetune_args.quantization_bit is not None:
+            # 启用模型量化需要开启
+            model = prepare_model_for_kbit_training(model)
+
+        if finetune_args.use_lora:
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                target_modules=finetune_args.lora_target,
+                inference_mode=False,
+                r=finetune_args.lora_rank,
+                lora_alpha=finetune_args.lora_alpha,
+                lora_dropout=finetune_args.lora_dropout,
+            )
+            # adalora 会出现 https://github.com/huggingface/peft/issues/479
+
+            model = get_peft_model(model, peft_config)
+
+            # 分布式训练
+            model.is_parallelizable = True
+            model.model_parallel = True
+            model.print_trainable_parameters()
+
+        # tokenizer.pad_token_id = model.generation_config.pad_token_id
+
+    elif training_args.do_eval and not training_args.do_train:
+        # 模型只做验证的时候
+        config = AutoConfig.from_pretrained(finetune_args.model_name_or_path, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            finetune_args.model_name_or_path,
+            use_fast=finetune_args.use_fast_tokenizer,
+            trust_remote_code=True,
+        )
+
+        if training_args.predict_with_generate:
+            tokenizer.padding_side = "left"
+
+        model = AutoModelForCausalLM.from_pretrained(
+            finetune_args.model_name_or_path,
+            from_tf=bool(".ckpt" in finetune_args.model_name_or_path),
+            config=config,
+            trust_remote_code=True,
+        )
+
+        if finetune_args.use_lora and finetune_args.lora_ckpt_path:
+            peft_model = PeftModel.from_pretrained(model, finetune_args.lora_ckpt_path)
+            model = peft_model.merge_and_unload()
+        else:
+            raise ValueError("evaluate need use lora and lora ckpt path")
 
     tokenizer.pad_token_id = model.generation_config.pad_token_id
-    if training_args.predict_with_generate:
-        tokenizer.padding_side = "left"
+    # 训练的时候不能采用left padding
+
     ############# prepare data ###########
 
     data_files = {}
@@ -501,8 +536,7 @@ def main():
 
     def preprocessing_function_train(examples):
         max_seq_length = finetune_args.max_source_length + finetune_args.max_target_length + 1
-        # 添加EOS
-
+        # 需要添加EOS
         model_inputs = {
             "input_ids": [],
             "labels": [],
@@ -575,25 +609,28 @@ def main():
         return model_inputs
 
     column_names = raw_datasets["train"].column_names
-    with training_args.main_process_first(desc="processing training dataset"):
-        train_dataset = raw_datasets["train"].map(
-            preprocessing_function_train,
-            batched=True,
-            num_proc=finetune_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not finetune_args.overwrite_cache,
-            desc="Running tokenizer on train dataset",
-        )
 
-    with training_args.main_process_first(desc="processing validation datset"):
-        eval_dataset = raw_datasets["validation"].map(
-            preprocessing_function_train,
-            batched=True,
-            num_proc=finetune_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not finetune_args.overwrite_cache,
-            desc="Running tokenizer on validation dataset",
-        )
+    if training_args.do_train:
+        with training_args.main_process_first(desc="processing training dataset"):
+            train_dataset = raw_datasets["train"].map(
+                preprocessing_function_train,
+                batched=True,
+                num_proc=finetune_args.preprocessing_num_workers,
+                remove_columns=column_names,
+                load_from_cache_file=not finetune_args.overwrite_cache,
+                desc="Running tokenizer on train dataset",
+            )
+
+    if training_args.do_eval:
+        with training_args.main_process_first(desc="processing validation datset"):
+            eval_dataset = raw_datasets["validation"].map(
+                preprocessing_function_train,
+                batched=True,
+                num_proc=finetune_args.preprocessing_num_workers,
+                remove_columns=column_names,
+                load_from_cache_file=not finetune_args.overwrite_cache,
+                desc="Running tokenizer on validation dataset",
+            )
 
     # def compute_metrics(eval_preds):
     #     preds, labels = eval_preds
@@ -644,8 +681,8 @@ def main():
 
     trainer = SftTrainer(
         model=model,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
         args=training_args,
         data_collator=DataCollatorForSeq2Seq(
             tokenizer,
@@ -654,7 +691,9 @@ def main():
             return_tensors="pt",
             padding=True,
         ),
-        compute_metrics=ComputeMetrics(tokenizer) if training_args.predict_with_generate else None,
+        compute_metrics=ComputeMetrics(tokenizer)
+        if training_args.do_eval and training_args.predict_with_generate
+        else None,
     )
 
     if training_args.do_train:
@@ -675,7 +714,10 @@ def main():
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_model()
-
+        try:
+            tokenizer.save_pretrained(training_args.output_dir)
+        except:
+            logger.warning("Cannot save tokenizer, please copy the files manually.")
         # if trainer.is_world_process_zero():
         #     logger.info(f"Saving model checkpoint to {training_args.output_dir}")
         #     if is_deepspeed_zero3_enabled():

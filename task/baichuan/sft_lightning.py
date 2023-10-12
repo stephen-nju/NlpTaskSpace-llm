@@ -6,6 +6,7 @@ import os
 import pickle
 from functools import partial
 from os import cpu_count
+from typing import TYPE_CHECKING, Any, Dict
 
 import bitsandbytes as bnb
 import deepspeed
@@ -18,109 +19,50 @@ from lightning import (
     Trainer,
     seed_everything,
 )
-from lightning.strategies import DeepSpeedStrategy
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.strategies import DeepSpeedStrategy
 from multiprocess.dummy import Pool
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from llm.src.datasets.sft_dataset import (
+    SftInstructInputExample,
+    SftInstructTemplate,
+    convert_sft_examples_to_features,
+    get_sft_template,
+    register_sft_template,
+    sft_templates,
+)
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    GenerationConfig,
+    get_cosine_schedule_with_warmup,
+    get_cosine_with_hard_restarts_schedule_with_warmup,
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup,
 )
 
-class BaichuanInputExampel:
-    def __init__(self, text, labels) -> None:
-        self.text = text
-        self.labels = labels
 
-
-class BaichuanInputFeature:
-    def __init__(self, input_ids, labels) -> None:
-        self.input_ids = input_ids
-        self.labels = labels
-
-
-def convert_example_to_feature(example, tokenizer, max_source_length, max_target_length, pad_token_id, eos_token_id):
-    prefix = """命名实体识别：抽取文本中的 品牌，品类，系列型号 这三类命名实体，并按照json格式返回结果。\n\n"""
-
-    max_seq_length = max_source_length + max_target_length + 1
-    query, answer = example.text, example.labels
-    answer = str(answer)
-    prompt = prefix + query + " ->"
-
-    a_ids = tokenizer.encode(
-        text=prompt,
-        add_special_tokens=True,
-        truncation=True,
-        max_length=max_source_length,
-    )
-    b_ids = tokenizer.encode(
-        text=answer,
-        add_special_tokens=False,
-        truncation=True,
-        max_length=max_target_length,
-    )
-
-    context_length = len(a_ids)
-    input_ids = a_ids + b_ids + [eos_token_id]
-    # print(f"===={model.generation_config.pad_token_id}")
-    labels = [pad_token_id] * context_length + b_ids + [eos_token_id]
-    # 构建 batch padding
-    pad_len = max_seq_length - len(input_ids)
-    input_ids = input_ids + [pad_token_id] * pad_len
-    labels = labels + [pad_token_id] * pad_len
-    # if args.ignore_pad_token_for_loss:
-    labels = [(l if l != pad_token_id else -100) for l in labels]
-
-    return BaichuanInputFeature(input_ids=input_ids, labels=labels)
-
-
-def convert_examples_to_features(
-    examples, tokenizer, max_source_length, max_target_length, pad_token_id, eos_token_id, threads=4
-):
-    threads = min(threads, cpu_count())
-    with Pool(threads) as p:
-        annotate_ = partial(
-            convert_example_to_feature,
-            tokenizer=tokenizer,
-            pad_token_id=pad_token_id,
-            eos_token_id=eos_token_id,
-            max_source_length=max_source_length,
-            max_target_length=max_target_length,
-        )
-        features = list(
-            tqdm(
-                p.imap(annotate_, examples, chunksize=32),
-                total=len(examples),
-                desc="convert examples to features",
-            )
-        )
-    return features
-
-
-class BaichuanDataset(Dataset):
-    def __init__(self, features) -> None:
+class SftDataset(Dataset):
+    def __init__(self, features):
         self.features = features
-        super().__init__()
 
     def __len__(self):
         return len(self.features)
 
     def __getitem__(self, index):
         feature = self.features[index]
-
         return {
             "input_ids": torch.tensor(feature.input_ids, dtype=torch.long),
             "labels": torch.tensor(feature.labels, dtype=torch.long),
         }
 
 
-class BaichuanDataModule(LightningDataModule):
+class SftDataModule(LightningDataModule):
     def __init__(self, args) -> None:
         self.args = args
         self.config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
@@ -129,8 +71,8 @@ class BaichuanDataModule(LightningDataModule):
             use_fast=not args.use_slow_tokenizer,
             trust_remote_code=True,
         )
-        self.pad_token_id = 0
-        self.eos_token_id = 2
+        self.template = get_sft_template("baichuan")
+
         self.cache_path = os.path.join(os.path.dirname(args.train_data), "cache")
         if not os.path.exists(self.cache_path):
             os.makedirs(self.cache_path)
@@ -138,108 +80,162 @@ class BaichuanDataModule(LightningDataModule):
 
     def prepare_data(self):
         train_examples = list(self.read_train_data(self.args.train_data))
-        train_features = convert_examples_to_features(
+        train_features = convert_sft_examples_to_features(
             examples=train_examples,
             tokenizer=self.tokenizer,
             max_source_length=self.args.max_source_length,
             max_target_length=self.args.max_target_length,
-            pad_token_id=self.pad_token_id,
-            eos_token_id=self.eos_token_id,
+            template=self.template,
+            stage="train",
         )
 
         with open(os.path.join(self.cache_path, "train_feature.pkl"), "wb") as g:
             pickle.dump(train_features, g)
 
-        # dev_examples = list(self.read_train_data(self.args.dev_data))
-        # dev_features = convert_examples_to_features(examples=dev_examples,
-        #                                             tokenizer=self.tokenizer,
-        #                                             max_length=self.args.max_length
-        # pad_token_id=self.pad_token_id,
-        # eos_token_id=self.eos_token_id,
-        #                                             )
+        dev_examples = list(self.read_train_data(self.args.dev_data))
+        dev_features = convert_sft_examples_to_features(
+            examples=dev_examples,
+            tokenizer=self.tokenizer,
+            max_source_length=self.args.max_source_length,
+            max_target_length=self.args.max_target_length,
+            template=self.template,
+            stage="eval",
+        )
 
-        # with open(os.path.join(self.cache_path, "dev_feature.pkl"), "wb") as g:
-        #     pickle.dump(dev_features, g)
+        with open(os.path.join(self.cache_path, "dev_feature.pkl"), "wb") as g:
+            pickle.dump(dev_features, g)
 
     @staticmethod
     def read_train_data(path):
         with open(path, "r", encoding="utf-8") as g:
             for line in g:
                 data = json.loads(line)
-                yield BaichuanInputExampel(text=data["context"], labels=data["ner"])
+                yield SftInstructInputExample(
+                    instruction=data["instruction"], input=data["input"], output=data["output"]
+                )
 
     def setup(self, stage: str) -> None:
         with open(os.path.join(self.cache_path, "train_feature.pkl"), "rb") as g:
             self.train_features = pickle.load(g)
 
-        # with open(os.path.join(self.cache_path, "dev_feature.pkl"), "rb") as g:
-        #     self.dev_features = pickle.load(g)
+        with open(os.path.join(self.cache_path, "dev_feature.pkl"), "rb") as g:
+            self.dev_features = pickle.load(g)
 
     def train_dataloader(self):
         return DataLoader(
-            dataset=BaichuanDataset(self.train_features),
+            dataset=SftDataset(self.train_features),
             batch_size=self.args.batch_size,
             num_workers=4,
             pin_memory=True,
         )
 
-
-# def val_dataloader(self):
-#      return DataLoader(dataset=Baichuan7bNerDataset(self.dev_features),
-#                        batch_size=self.args.batch_size,
-#                        num_workers=4,
-#                        pin_memory=True
-#                        )
+    def val_dataloader(self):
+        return DataLoader(
+            dataset=SftDataset(self.dev_features), batch_size=self.args.batch_size, num_workers=4, pin_memory=True
+        )
 
 
-class BaichuanModule(LightningModule):
+class SftModule(LightningModule):
     def __init__(self, args):
         super().__init__()
         self.args = args
         # 加载模型
-        config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
             args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-            low_cpu_mem_usage=args.low_cpu_mem_usage,
+            use_fast=not args.use_slow_tokenizer,
             trust_remote_code=True,
-            # device_map="auto",
         )
-        # 模型初始化
-        # embedding_size = self.model.get_input_embeddings().weight.shape[0]
+        self.generation_config = GenerationConfig.from_pretrained(arg.model_name_or_path, trust_remote_code=True)
+        self.tokenizer.pad_token_id = self.generation_config.pad_token_id
+
+        register_sft_template(
+            SftInstructTemplate(
+                name="baichuan",
+                pad_token_id=self.generation_config.pad_token_id,
+                eos_token_id=self.generation_config.eos_token_id,
+            )
+        )
+
+        if self.args.quantization_bit is not None:
+            print(f"Quantized to {self.args.quantization_bit}")
+            if self.args.quantization_bit == "4bit":
+                # load_in_4bit = (True,)
+                quantization_config = BitsAndBytesConfig(
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+            elif self.args.quantization_bit == "8bit":
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+            else:
+                raise ValueError("unsupport quantization_bit")
+
+            model = AutoModelForCausalLM.from_pretrained(
+                self.args.model_name_or_path,
+                from_tf=bool(".ckpt" in self.args.model_name_or_path),
+                config=self.config,
+                quantization_config=quantization_config,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+            )
+
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                self.args.model_name_or_path,
+                from_tf=bool(".ckpt" in self.args.model_name_or_path),
+                config=self.config,
+                trust_remote_code=True,
+            )
+        # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
+        # on a small vocab and want a smaller embedding size, remove this test.
+
+        # embedding_size = model.get_input_embeddings().weight.shape[0]
         # if len(tokenizer) > embedding_size:
-        #     self.model.resize_token_embeddings(len(tokenizer))
+        #     model.resize_token_embeddings(len(tokenizer))
 
-        # model setting and lora config
         # model.supports_gradient_checkpointing = True  #
-        self.model.gradient_checkpointing_enable()
-        self.model.enable_input_require_grads()
 
-        self.model.config.use_cache = False  # silence the warnings. Please re-enable for inference!the datasets
-        self.model = self.model.half()
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
 
-        # 配置LoraConfig
-        if args.quantization_bit is not None:
-            print(f"Quantized to {args.quantization_bit} bit")
-            self.model = self.model.quantize(args.quantization_bit)
+        model.config.use_cache = False  # silence the warnings. Please re-enable for inference!the datasets
 
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            target_modules=["W_pack"],
-            inference_mode=False,
-            r=16,
-            lora_alpha=16,
-            lora_dropout=0.05,
-        )
-        # adalora 会出现 https://github.com/huggingface/peft/issues/479
-        self.model = get_peft_model(self.model, peft_config)
-        self.model.is_parallelizable = True
-        self.model.model_parallel = True
+        # 分布式训练
+        model.is_parallelizable = True
+        model.model_parallel = True
+
+        if self.args.quantization_bit is not None:
+            # 启用模型量化需要开启
+            model = prepare_model_for_kbit_training(model)
+
+        if self.args.use_lora:
+            if isinstance(self.args.lora_target, str):  # support custom target modules/layers of LoRA
+                lora_target = [target.strip() for target in self.args.lora_target.split(",")]
+
+            ### TODO 添加全量lora 的微调
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                target_modules=lora_target,
+                inference_mode=False,
+                r=self.args.lora_rank,
+                lora_alpha=self.args.lora_alpha,
+                lora_dropout=self.args.lora_dropout,
+            )
+            # adalora 会出现 https://github.com/huggingface/peft/issues/479
+
+            model = get_peft_model(model, peft_config)
+
+            # 分布式训练
+            model.is_parallelizable = True
+            model.model_parallel = True
+            model.print_trainable_parameters()
+
+        self.model = model
         self.model.print_trainable_parameters()
         self.save_hyperparameters()
 
+    @property
     def deepspeed_offload(self) -> bool:
         strategy = self.trainer.strategy
         if isinstance(strategy, DeepSpeedStrategy):
@@ -247,19 +243,25 @@ class BaichuanModule(LightningModule):
             return config.get("offload_optimizer") or config.get("offload_param")
         return False
 
+    # @property
+    # def deepspeed(self) -> bool:
+    #     strategy = self.trainer.strategy
+    #     return isinstance(strategy, DeepSpeedStrategy)
+
     def configure_optimizers(self):
         no_decay = ["bias", "LayerNorm.weight"]
         params_decay = [p for n, p in self.named_parameters() if not any(nd in n for nd in no_decay)]
         params_nodecay = [p for n, p in self.named_parameters() if any(nd in n for nd in no_decay)]
+
         optim_groups = [
-            {"params": params_decay, "weight_decay": self.hparams.weight_decay},
+            {"params": params_decay, "weight_decay": self.args.weight_decay},
             {"params": params_nodecay, "weight_decay": 0.0},
         ]
 
         if self.deepspeed_offload:
-            optimizer = DeepSpeedCPUAdam(optim_groups, lr=self.args.learning_rate, betas=self.args.betas)
-        optimizer = torch.optim.AdamW(optim_groups, lr=self.args.learning_rate, betas=self.args.betas)
+            optimizer = DeepSpeedCPUAdam(optim_groups, lr=self.args.learning_rate, eps=self.arsg.adam_epsilon)
 
+        optimizer = torch.optim.AdamW(optim_groups, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
         num_gpus = self.trainer.num_devices
         # 注：只有在使用pytorch Lightning的LightningDataModule 时候才可以使用该方式回去训练集大小
         t_total = (
@@ -290,22 +292,28 @@ class BaichuanModule(LightningModule):
                 t_total,
                 lr_end=self.args.learning_rate / 4.0,
             )
-        elif self.args.lr_scheduler == "cawr":
-            # TODO
-            step = (len(self.trainer.datamodule.train_dataloader())) // (
-                self.trainer.accumulate_grad_batches * num_gpus + 1
-            )
+        elif self.args.lr_scheduler == "cosine":
+            scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, t_total)
 
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                optimizer, step * self.args.rewarm_epoch_num, 1
-            )
         else:
             raise ValueError("lr_scheduler does not exist.")
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
 
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        if self.global_rank == 0:
+            save_path = os.path.join(self.args.output_dir, "hf_model")
+            self.model.save_pretrained(save_path)
+            self.tokenizer.save_pretrained(save_path)
+
     def training_step(self, batch, batch_idx):
         output = self.model(**batch)
+        self.log("lr", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, on_epoch=True)
+        self.log("train_loss", output.loss, on_step=True, prog_bar=True, on_epoch=True)
+
         return output.loss
+
+    # def validation_step(self, batch, batch_idx):
+    #     pass
 
 
 if __name__ == "__main__":
@@ -315,12 +323,24 @@ if __name__ == "__main__":
     parser.add_argument("--test_data", type=str, default="", help="test data path")
     parser.add_argument("--dev_data", type=str, default="", help="dev data path")
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
+    parser.add_argument("--deepspeed", type=str, default=None, help="deepspeed config file path")
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=500,
+    )
 
     parser.add_argument(
         "--lr_scheduler",
-        choices=["linear", "onecycle", "polydecay", "cawr"],
-        default="cawr",
+        choices=["linear", "onecycle", "polydecay", "cosine"],
+        default="cosine",
     )
+
     parser.add_argument(
         "--rewarm_epoch_num",
         type=int,
@@ -479,13 +499,51 @@ if __name__ == "__main__":
         default=None,
         help="quantization training",
     )
+    parser.add_argument("--use_lora", type=bool, default=True, help="using lora")
 
+    parser.add_argument("--lora_rank", type=int, default=8, help="The intrinsic dimension for LoRA fine-tuning.")
+    parser.add_argument(
+        "--lora_alpha",
+        type=float,
+        default=32,
+        help="The scale factor for LoRA fine-tuning (similar with the learning rate)",
+    )
+
+    parser.add_argument("--lora_dropout", type=float, default=0.1, help="")
+    parser.add_argument(
+        "--lora_target",
+        type=str,
+        default=None,
+        help='Baichuan choices: ["W_pack", "o_proj", "gate_proj", "up_proj", "down_proj"]',
+    )
+    parser.add_argument("--lora_ckpt_path", type=str, default=None, help="")
     arg = parser.parse_args()
 
     if arg.seed is not None:
         seed_everything(arg.seed)
 
-    # datamodule = Baichuan7bNerDataModule(arg)
-    # model = Baichuan7bNerModule(arg)
-    # trainer = Trainer(accelerator="gpu", strategy="ddp", devices=1, max_epochs=arg.max_epochs)
-    # trainer.fit(model, datamodule=datamodule)
+    # 先加载模型，再加载数据
+    model = SftModule(arg)
+
+    datamodule = SftDataModule(arg)
+
+    if arg.deepspeed:
+        strategy = DeepSpeedStrategy(config=arg.deepspeed)
+    else:
+        strategy = "ddp"
+
+    # 添加常用的checkpoint
+    callbacks = []
+    checkpoint = ModelCheckpoint(dirpath=arg.output_dir, every_n_train_steps=arg.save_steps, save_last=True)
+    callbacks.append(checkpoint)
+
+    trainer = Trainer(
+        devices="auto",
+        max_epochs=arg.max_epochs,
+        strategy=strategy,
+        callbacks=callbacks,
+        log_every_n_steps=1,
+        default_root_dir=arg.output_dir,
+    )
+
+    trainer.fit(model, datamodule=datamodule)
