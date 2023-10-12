@@ -27,6 +27,8 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from llm.src.datasets.sft_dataset import (
+    SftChatInstructTemplate,
+    SftDataset,
     SftInstructInputExample,
     SftInstructTemplate,
     convert_sft_examples_to_features,
@@ -47,55 +49,36 @@ from transformers import (
 )
 
 
-class SftDataset(Dataset):
-    def __init__(self, features):
-        self.features = features
-
-    def __len__(self):
-        return len(self.features)
-
-    def __getitem__(self, index):
-        feature = self.features[index]
-        return {
-            "input_ids": torch.tensor(feature.input_ids, dtype=torch.long),
-            "labels": torch.tensor(feature.labels, dtype=torch.long),
-        }
-
-
 class SftDataModule(LightningDataModule):
     def __init__(self, args) -> None:
         self.args = args
         self.config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            args.model_name_or_path,
-            use_fast=not args.use_slow_tokenizer,
-            trust_remote_code=True,
-        )
-        self.template = get_sft_template("baichuan")
-
+        self.template = get_sft_template(self.config.model_type)
         self.cache_path = os.path.join(os.path.dirname(args.train_data), "cache")
         if not os.path.exists(self.cache_path):
             os.makedirs(self.cache_path)
         super().__init__()
 
     def prepare_data(self):
-        train_examples = list(self.read_train_data(self.args.train_data))
+        if self.args.chat:
+            self.process_sft_chat_data()
+        else:
+            self.process_sft_data()
+
+    def process_sft_data(self):
+        train_examples = list(self.read_sft_data(self.args.train_data))
         train_features = convert_sft_examples_to_features(
             examples=train_examples,
-            tokenizer=self.tokenizer,
             max_source_length=self.args.max_source_length,
             max_target_length=self.args.max_target_length,
             template=self.template,
             stage="train",
         )
-
         with open(os.path.join(self.cache_path, "train_feature.pkl"), "wb") as g:
             pickle.dump(train_features, g)
-
-        dev_examples = list(self.read_train_data(self.args.dev_data))
+        dev_examples = list(self.read_sft_data(self.args.dev_data))
         dev_features = convert_sft_examples_to_features(
             examples=dev_examples,
-            tokenizer=self.tokenizer,
             max_source_length=self.args.max_source_length,
             max_target_length=self.args.max_target_length,
             template=self.template,
@@ -105,8 +88,11 @@ class SftDataModule(LightningDataModule):
         with open(os.path.join(self.cache_path, "dev_feature.pkl"), "wb") as g:
             pickle.dump(dev_features, g)
 
+    def process_sft_chat_data(self):
+        pass
+
     @staticmethod
-    def read_train_data(path):
+    def read_sft_data(path):
         with open(path, "r", encoding="utf-8") as g:
             for line in g:
                 data = json.loads(line)
@@ -146,16 +132,7 @@ class SftModule(LightningModule):
             use_fast=not args.use_slow_tokenizer,
             trust_remote_code=True,
         )
-        self.generation_config = GenerationConfig.from_pretrained(arg.model_name_or_path, trust_remote_code=True)
-        self.tokenizer.pad_token_id = self.generation_config.pad_token_id
-
-        register_sft_template(
-            SftInstructTemplate(
-                name="baichuan",
-                pad_token_id=self.generation_config.pad_token_id,
-                eos_token_id=self.generation_config.eos_token_id,
-            )
-        )
+        self.preprocess_configure()
 
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
@@ -212,7 +189,6 @@ class SftModule(LightningModule):
         if self.args.use_lora:
             if isinstance(self.args.lora_target, str):  # support custom target modules/layers of LoRA
                 lora_target = [target.strip() for target in self.args.lora_target.split(",")]
-
             ### TODO 添加全量lora 的微调
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
@@ -243,10 +219,34 @@ class SftModule(LightningModule):
             return config.get("offload_optimizer") or config.get("offload_param")
         return False
 
-    # @property
-    # def deepspeed(self) -> bool:
-    #     strategy = self.trainer.strategy
-    #     return isinstance(strategy, DeepSpeedStrategy)
+    def preprocess_configure(self):
+        # 处理模型，分词器初始化的配置
+        if self.config.model_type == "baichuan":
+            if self.args.chat:
+                register_sft_template(SftInstructTemplate())
+            else:
+                generation_config = GenerationConfig.from_pretrained(
+                    self.arg.model_name_or_path, trust_remote_code=True
+                )
+                self.tokenizer.pad_token_id = generation_config.pad_token_id
+                # 一个模型只注册一个模板,用于模型配置
+                register_sft_template(
+                    SftInstructTemplate(
+                        name=self.config.model_type,
+                        tokenizer=self.tokenzier,
+                    )
+                )
+
+        elif self.config.model_type == "qwen":
+            register_sft_template(
+                SftInstructTemplate(
+                    name=self.config.model_type,
+                    tokenzier=self.tokenizer,
+                )
+            )
+            self.tokenizer.pad_token_id = self.tokenizer.eod_id
+            self.tokenizer.bos_token_id = self.tokenizer.eod_id
+            self.tokenizer.eos_token_id = self.tokenizer.eod_id
 
     def configure_optimizers(self):
         no_decay = ["bias", "LayerNorm.weight"]
@@ -312,8 +312,8 @@ class SftModule(LightningModule):
 
         return output.loss
 
-    # def validation_step(self, batch, batch_idx):
-    #     pass
+    def validation_step(self, batch, batch_idx):
+        pass
 
 
 if __name__ == "__main__":
@@ -323,6 +323,19 @@ if __name__ == "__main__":
     parser.add_argument("--test_data", type=str, default="", help="test data path")
     parser.add_argument("--dev_data", type=str, default="", help="dev data path")
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
+    parser.add_argument(
+        "--model_name_or_path",
+        type=str,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+        required=False,
+    )
+    parser.add_argument("--chat", action="store_true")
+    parser.add_argument(
+        "--chat",
+        type=str,
+        help="template name",
+        required=False,
+    )
     parser.add_argument("--deepspeed", type=str, default=None, help="deepspeed config file path")
     parser.add_argument(
         "--precision",
@@ -367,12 +380,6 @@ if __name__ == "__main__":
         help="final div factor of linear decay scheduler",
     )
 
-    parser.add_argument(
-        "--model_name_or_path",
-        type=str,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=False,
-    )
     parser.add_argument("--optimizer", type=str, help=("model optimizer"))
     parser.add_argument(
         "--use_slow_tokenizer",

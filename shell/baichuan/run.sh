@@ -43,34 +43,6 @@ MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 
 # wait
 
-# baichuan13b 过拟合数据集
-deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
-	--deepspeed ${DS_CONFIG_STAGE_3} \
-	--do_train \
-	--model_name_or_path ${BAICHUAN2_13B} \
-	--report_to tensorboard \
-	--overwrite_output_dir \
-	--overwrite_cache \
-	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/overfit/train.json \
-	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/dev.json \
-	--num_train_epochs 20 \
-	--overwrite_cache \
-	--output_dir /home/zb/saved_checkpoint/baichuan_13b_overfit_5epoch \
-	--use_lora true \
-	--lora_target W_pack \
-	--max_source_length 1024 \
-	--max_target_length 128 \
-	--warmup_ratio 0.1 \
-	--logging_steps 10 \
-	--lr_scheduler_type cosine \
-	--per_device_train_batch_size 8 \
-	--per_device_eval_batch_size 8 \
-	--save_steps 100 \
-	--save_total_limit=2 \
-	--learning_rate 2e-5 \
-	--bf16 true \
-	--tf32 true
-
 # wait
 # baichuan13b 2个epoch用于对比测试学习率
 # deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
@@ -263,6 +235,35 @@ deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" tas
 	--max_source_length 1024 \
 	--max_target_length 128 \
 	--warmup_ratio 0.0 \
+	--logging_steps 10 \
+	--lr_scheduler_type cosine \
+	--per_device_train_batch_size 8 \
+	--per_device_eval_batch_size 8 \
+	--save_steps 100 \
+	--save_total_limit=2 \
+	--learning_rate 2e-5 \
+	--bf16 true \
+	--tf32 true
+
+wait
+# baichuan13b 过拟合数据集
+deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+	--deepspeed ${DS_CONFIG_STAGE_3} \
+	--do_train \
+	--model_name_or_path ${BAICHUAN2_13B} \
+	--report_to tensorboard \
+	--overwrite_output_dir \
+	--overwrite_cache \
+	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/overfit/train.json \
+	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/dev.json \
+	--num_train_epochs 20 \
+	--overwrite_cache \
+	--output_dir /home/zb/saved_checkpoint/baichuan_13b_overfit_20epoch \
+	--use_lora true \
+	--lora_target W_pack \
+	--max_source_length 1024 \
+	--max_target_length 128 \
+	--warmup_ratio 0.1 \
 	--logging_steps 10 \
 	--lr_scheduler_type cosine \
 	--per_device_train_batch_size 8 \

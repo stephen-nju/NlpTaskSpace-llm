@@ -10,7 +10,9 @@ import torch
 from multiprocess.dummy import Pool
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
 from llm.src.constant import IGNORE_INDEX
+
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils import PreTrainedTokenizer
@@ -41,8 +43,7 @@ class SftInstructTemplate:
     """
 
     name: str
-    pad_token_id: int
-    eos_token_id: int
+    tokenizer: "PreTrainedTokenizer"
 
 
 sft_templates: Dict[str, SftInstructTemplate] = {}
@@ -58,14 +59,14 @@ def get_sft_template(name: str):
 
 def convert_sft_example_to_feature(
     example: "SftInstructInputExample",
-    tokenizer: "PreTrainedTokenizer",
     template,
     max_source_length,
     max_target_length,
     stage,
 ):
-    pad_token_id = template.pad_token_id
-    eos_token_id = template.eos_token_id
+    tokenizer = template.tokenizer
+    pad_token_id = template.tokenizer.pad_token_id
+    eos_token_id = template.tokenizer.eos_token_id
     if stage == "train":
         instruction = example.instruction
         max_seq_length = max_source_length + max_target_length + 1
@@ -123,13 +124,12 @@ def convert_sft_example_to_feature(
 
 
 def convert_sft_examples_to_features(
-    examples, tokenizer, max_source_length, max_target_length, template, stage="train", threads=4
+    examples, max_source_length, max_target_length, template, stage="train", threads=4
 ):
     threads = min(threads, cpu_count())
     with Pool(threads) as p:
         annotate_ = partial(
             convert_sft_example_to_feature,
-            tokenizer=tokenizer,
             template=template,
             max_source_length=max_source_length,
             max_target_length=max_target_length,
@@ -145,75 +145,76 @@ def convert_sft_examples_to_features(
     return features
 
 
-# @dataclass
-# class SftChatInputExample:
-#     """
-#     模型做sft时候的数据,example
-#     """
+@dataclass
+class SftInstructionChatTemplate:
+    """
+    模型做sft时候的数据,example
+    """
 
-#     name: str
-#     # The system prompt
-#     system_prompt: str
-#     # All messages. format: list of [question, answer]
-#     messages: Optional[List[Sequence[str]]]
-#     # The roles of the speakers
-#     roles: Optional[Sequence[str]]
-#     # Conversation prompt
-#     prompt: str
-#     # Separator
-#     sep: str
-#     # Stop token, default is tokenizer.eos_token
+    name: str
+    tokenizer: "PreTrainedTokenizer"
+    # The system prompt
+    system_prompt: str
+    # All messages. format: list of [question, answer]
+    messages: Optional[List[Sequence[str]]]
+    # The roles of the speakers
+    roles: Optional[Sequence[str]]
+    # Conversation prompt
+    prompt: str
+    # Separator
+    sep: str
+    # Stop token, default is tokenizer.eos_token
 
-#     stop_str: Optional[str] = "</s>"
+    stop_str: Optional[str] = "</s>"
 
-#     def get_prompt(self, messages: Optional[List[Sequence[str]]] = None, system_prompt: Optional[str] = "") -> str:
-#         """
+    def get_prompt(self, messages: Optional[List[Sequence[str]]] = None, system_prompt: Optional[str] = "") -> str:
+        """
 
-#         Returns a string containing prompt without response.
+        Returns a string containing prompt without response.
 
-#         """
+        """
 
-#         return "".join(self._format_example(messages, system_prompt))
+        return "".join(self._format_example(messages, system_prompt))
 
-#     def get_dialog(
-#         self, messages: Optional[List[Sequence[str]]] = None, system_prompt: Optional[str] = ""
-#     ) -> List[str]:
-#         """
+    def get_dialog(
+        self, messages: Optional[List[Sequence[str]]] = None, system_prompt: Optional[str] = ""
+    ) -> List[str]:
+        """
 
-#         Returns a list containing 2 * n elements where the 2k-th is a query and the (2k+1)-th is a response.
+        Returns a list containing 2 * n elements where the 2k-th is a query and the (2k+1)-th is a response.
 
-#         """
+        """
 
-#         return self._format_example(messages, system_prompt)
+        return self._format_example(messages, system_prompt)
 
-#     def _format_example(
-#         self, messages: Optional[List[Sequence[str]]] = None, system_prompt: Optional[str] = ""
-#     ) -> List[str]:
-#         system_prompt = system_prompt or self.system_prompt
+    def _format_example(
+        self, messages: Optional[List[Sequence[str]]] = None, system_prompt: Optional[str] = ""
+    ) -> List[str]:
+        system_prompt = system_prompt or self.system_prompt
 
-#         system_prompt = system_prompt + self.sep if system_prompt else ""  # add separator for non-empty system prompt
+        system_prompt = system_prompt + self.sep if system_prompt else ""  # add separator for non-empty system prompt
 
-#         messages = messages or self.messages
+        messages = messages or self.messages
 
-#         convs = []
+        convs = []
 
-#         for turn_idx, [user_query, bot_resp] in enumerate(messages):
-#             if turn_idx == 0:
-#                 convs.append(system_prompt + self.prompt.format(query=user_query))
+        for turn_idx, [user_query, bot_resp] in enumerate(messages):
+            if turn_idx == 0:
+                convs.append(system_prompt + self.prompt.format(query=user_query))
 
-#                 convs.append(bot_resp)
+                convs.append(bot_resp)
 
-#             else:
-#                 convs.append(self.sep + self.prompt.format(query=user_query))
+            else:
+                convs.append(self.sep + self.prompt.format(query=user_query))
 
-#                 convs.append(bot_resp)
+                convs.append(bot_resp)
 
-#         return convs
+        return convs
 
-#     def append_message(self, query: str, answer: str):
-#         """Append a new message."""
+    def append_message(self, query: str, answer: str):
+        """Append a new message."""
 
-#         self.messages.append([query, answer])
+        self.messages.append([query, answer])
 
 
 # @dataclass
@@ -227,8 +228,38 @@ def convert_sft_examples_to_features(
 
 
 # # 用于构建不同chat模型的数据
-# chat_templates: Dict[str, SftChatInputExample] = {}
+chat_templates: Dict[str, SftInstructionChatTemplate] = {}
 
 
 # def register_chat_template(template: SftChatInputExample):
 #     chat_templates[template.name] = template
+
+
+class SftDataset(Dataset):
+    def __init__(self, features):
+        self.features = features
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, index):
+        feature = self.features[index]
+        return {
+            "input_ids": torch.tensor(feature.input_ids, dtype=torch.long),
+            "labels": torch.tensor(feature.labels, dtype=torch.long),
+        }
+
+
+class SftChatDataset(Dataset):
+    def __init__(self, features):
+        self.features = features
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, index):
+        feature = self.features[index]
+        return {
+            "input_ids": torch.tensor(feature.input_ids, dtype=torch.long),
+            "labels": torch.tensor(feature.labels, dtype=torch.long),
+        }
