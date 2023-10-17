@@ -1,124 +1,37 @@
 # -----*----coding:utf8-----*----
 
 import argparse
-import json
+import functools
 import os
-import pickle
-from functools import partial
-from os import cpu_count
-from typing import TYPE_CHECKING, Any, Dict
+from typing import Any, Dict
 
-import bitsandbytes as bnb
-import deepspeed
+import jieba
+import numpy as np
 import torch
-import torch.nn as nn
+from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
-from lightning import (
-    LightningDataModule,
-    LightningModule,
-    Trainer,
-    seed_everything,
-)
+from lightning import LightningDataModule, LightningModule, Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.strategies import DeepSpeedStrategy
-from multiprocess.dummy import Pool
-from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
-
-from llm.src.datasets.sft_dataset import (
-    SftChatInstructTemplate,
-    SftDataset,
-    SftInstructInputExample,
-    SftInstructTemplate,
-    convert_sft_examples_to_features,
-    get_sft_template,
-    register_sft_template,
-    sft_templates,
-)
+from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from rouge_chinese import Rouge
+from torch.utils.data import DataLoader
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    DataCollatorForSeq2Seq,
     GenerationConfig,
     get_cosine_schedule_with_warmup,
-    get_cosine_with_hard_restarts_schedule_with_warmup,
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup,
 )
 
-
-class SftDataModule(LightningDataModule):
-    def __init__(self, args) -> None:
-        self.args = args
-        self.config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-        self.template = get_sft_template(self.config.model_type)
-        self.cache_path = os.path.join(os.path.dirname(args.train_data), "cache")
-        if not os.path.exists(self.cache_path):
-            os.makedirs(self.cache_path)
-        super().__init__()
-
-    def prepare_data(self):
-        if self.args.chat:
-            self.process_sft_chat_data()
-        else:
-            self.process_sft_data()
-
-    def process_sft_data(self):
-        train_examples = list(self.read_sft_data(self.args.train_data))
-        train_features = convert_sft_examples_to_features(
-            examples=train_examples,
-            max_source_length=self.args.max_source_length,
-            max_target_length=self.args.max_target_length,
-            template=self.template,
-            stage="train",
-        )
-        with open(os.path.join(self.cache_path, "train_feature.pkl"), "wb") as g:
-            pickle.dump(train_features, g)
-        dev_examples = list(self.read_sft_data(self.args.dev_data))
-        dev_features = convert_sft_examples_to_features(
-            examples=dev_examples,
-            max_source_length=self.args.max_source_length,
-            max_target_length=self.args.max_target_length,
-            template=self.template,
-            stage="eval",
-        )
-
-        with open(os.path.join(self.cache_path, "dev_feature.pkl"), "wb") as g:
-            pickle.dump(dev_features, g)
-
-    def process_sft_chat_data(self):
-        pass
-
-    @staticmethod
-    def read_sft_data(path):
-        with open(path, "r", encoding="utf-8") as g:
-            for line in g:
-                data = json.loads(line)
-                yield SftInstructInputExample(
-                    instruction=data["instruction"], input=data["input"], output=data["output"]
-                )
-
-    def setup(self, stage: str) -> None:
-        with open(os.path.join(self.cache_path, "train_feature.pkl"), "rb") as g:
-            self.train_features = pickle.load(g)
-
-        with open(os.path.join(self.cache_path, "dev_feature.pkl"), "rb") as g:
-            self.dev_features = pickle.load(g)
-
-    def train_dataloader(self):
-        return DataLoader(
-            dataset=SftDataset(self.train_features),
-            batch_size=self.args.batch_size,
-            num_workers=4,
-            pin_memory=True,
-        )
-
-    def val_dataloader(self):
-        return DataLoader(
-            dataset=SftDataset(self.dev_features), batch_size=self.args.batch_size, num_workers=4, pin_memory=True
-        )
+from llm.src.constant import IGNORE_INDEX
+from llm.src.datasets.preprocessing import preprocess_supervised_dataset
+from llm.src.datasets.template import get_template_and_fix_tokenizer
 
 
 class SftModule(LightningModule):
@@ -132,8 +45,8 @@ class SftModule(LightningModule):
             use_fast=not args.use_slow_tokenizer,
             trust_remote_code=True,
         )
-        self.preprocess_configure()
 
+        self.template = get_template_and_fix_tokenizer(self.args.template_name, self.tokenizer)
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
             if self.args.quantization_bit == "4bit":
@@ -211,6 +124,36 @@ class SftModule(LightningModule):
         self.model.print_trainable_parameters()
         self.save_hyperparameters()
 
+    def setup(self, stage):
+        raw_datasets = load_dataset("json", data_files={"train": self.args.train_data, "dev": self.args.dev_data})
+
+        preprocessing_function_train = functools.partial(
+            preprocess_supervised_dataset,
+            tokenizer=self.tokenizer,
+            template=self.template,
+            max_source_length=self.args.max_source_length,
+            max_target_length=self.args.max_target_length,
+        )
+        column_names = raw_datasets["train"].column_names
+        self.train_dataset = raw_datasets["train"].map(
+            preprocessing_function_train,
+            batched=True,
+            num_proc=self.args.preprocessing_num_workers,
+            remove_columns=column_names,
+            load_from_cache_file=not self.args.overwrite_cache,
+            desc="Running tokenizer on train dataset",
+        )
+
+        #
+        # self.dev_dataset = raw_datasets["dev"].map(
+        #         preprocessing_function_train,
+        #         batched=True,
+        #         num_proc=finetune_args.preprocessing_num_workers,
+        #         remove_columns=column_names,
+        #         load_from_cache_file=not finetune_args.overwrite_cache,
+        #         desc="Running tokenizer on train dataset",
+        #     )
+
     @property
     def deepspeed_offload(self) -> bool:
         strategy = self.trainer.strategy
@@ -218,35 +161,6 @@ class SftModule(LightningModule):
             config = strategy.config["zero_optimization"]
             return config.get("offload_optimizer") or config.get("offload_param")
         return False
-
-    def preprocess_configure(self):
-        # 处理模型，分词器初始化的配置
-        if self.config.model_type == "baichuan":
-            if self.args.chat:
-                register_sft_template(SftInstructTemplate())
-            else:
-                generation_config = GenerationConfig.from_pretrained(
-                    self.arg.model_name_or_path, trust_remote_code=True
-                )
-                self.tokenizer.pad_token_id = generation_config.pad_token_id
-                # 一个模型只注册一个模板,用于模型配置
-                register_sft_template(
-                    SftInstructTemplate(
-                        name=self.config.model_type,
-                        tokenizer=self.tokenzier,
-                    )
-                )
-
-        elif self.config.model_type == "qwen":
-            register_sft_template(
-                SftInstructTemplate(
-                    name=self.config.model_type,
-                    tokenzier=self.tokenizer,
-                )
-            )
-            self.tokenizer.pad_token_id = self.tokenizer.eod_id
-            self.tokenizer.bos_token_id = self.tokenizer.eod_id
-            self.tokenizer.eos_token_id = self.tokenizer.eod_id
 
     def configure_optimizers(self):
         no_decay = ["bias", "LayerNorm.weight"]
@@ -265,7 +179,7 @@ class SftModule(LightningModule):
         num_gpus = self.trainer.num_devices
         # 注：只有在使用pytorch Lightning的LightningDataModule 时候才可以使用该方式回去训练集大小
         t_total = (
-            len(self.trainer.datamodule.train_dataloader()) // (self.trainer.accumulate_grad_batches * num_gpus) + 1
+            len(self.train_dataloader()) // (self.trainer.accumulate_grad_batches * num_gpus) + 1
         ) * self.args.max_epochs
         warmup_steps = int(self.args.warmup_proportion * t_total)
 
@@ -312,8 +226,59 @@ class SftModule(LightningModule):
 
         return output.loss
 
-    def validation_step(self, batch, batch_idx):
+    # def validation_step(self, batch, batch_idx):
+    #     output = self.model(**batch)
+    #     self.log("eval_loss", output.loss, on_step=True, on_epoch=True)
+
+    def test_step(self, batch, batch_idx):
         pass
+        # output = self.model.generate(batch["input_ids"], max_new_tokens=128)
+        # output_text = self.tokenizer.decode(
+        #     output.sequence[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
+        # )
+        # 计算其它指标
+
+    def compute_metrics(self, eval_preds):
+        preds, labels = eval_preds
+        if isinstance(preds, tuple):
+            preds = preds[0]
+        decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True)
+        if self.args.ignore_pad_token_for_loss:
+            # Replace -100 in the labels as we can't decode them.
+            labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
+        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        score_dict = {"rouge-1": [], "rouge-2": [], "rouge-l": [], "bleu-4": []}
+        for pred, label in zip(decoded_preds, decoded_labels):
+            hypothesis = list(jieba.cut(pred))
+            reference = list(jieba.cut(label))
+            rouge = Rouge()
+            scores = rouge.get_scores(" ".join(hypothesis), " ".join(reference))
+            result = scores[0]
+
+            for k, v in result.items():
+                score_dict[k].append(round(v["f"] * 100, 4))
+            bleu_score = sentence_bleu([list(label)], list(pred), smoothing_function=SmoothingFunction().method3)
+            score_dict["bleu-4"].append(round(bleu_score * 100, 4))
+
+        for k, v in score_dict.items():
+            score_dict[k] = float(np.mean(v))
+        return score_dict
+
+    def train_dataloader(self):
+        return DataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.args.batch_size,
+            num_workers=4,
+            pin_memory=True,
+            collate_fn=DataCollatorForSeq2Seq(
+                self.tokenizer,
+                label_pad_token_id=IGNORE_INDEX if self.args.ignore_pad_token_for_loss else self.tokenizer.pad_token_id,
+                pad_to_multiple_of=8,
+                return_tensors="pt",
+                padding=True,
+            ),
+        )
 
 
 if __name__ == "__main__":
@@ -329,12 +294,11 @@ if __name__ == "__main__":
         help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
     )
-    parser.add_argument("--chat", action="store_true")
     parser.add_argument(
-        "--chat",
+        "--template_name",
         type=str,
         help="template name",
-        required=False,
+        required=True,
     )
     parser.add_argument("--deepspeed", type=str, default=None, help="deepspeed config file path")
     parser.add_argument(
@@ -532,7 +496,7 @@ if __name__ == "__main__":
     # 先加载模型，再加载数据
     model = SftModule(arg)
 
-    datamodule = SftDataModule(arg)
+    # datamodule = SftDataModule(arg)
 
     if arg.deepspeed:
         strategy = DeepSpeedStrategy(config=arg.deepspeed)
@@ -553,4 +517,4 @@ if __name__ == "__main__":
         default_root_dir=arg.output_dir,
     )
 
-    trainer.fit(model, datamodule=datamodule)
+    trainer.fit(model)

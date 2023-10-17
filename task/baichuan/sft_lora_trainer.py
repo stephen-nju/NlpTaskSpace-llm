@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import bitsandbytes as bnb
+import datasets
 import jieba
 import numpy as np
 import torch
@@ -545,7 +546,7 @@ def main():
         for i in range(len(examples["input"])):
             if examples["input"][i] and examples["output"][i] and examples["instruction"]:
                 inputs, outputs, instruction = examples["input"][i], examples["output"][i], examples["instruction"][i]
-                outputs = str(outputs)
+                outputs = outputs
                 prompt = instruction + inputs + " ->"
 
                 a_ids = tokenizer.encode(
@@ -586,7 +587,7 @@ def main():
                 instruction = examples["instruction"][i]
                 inputs = instruction + inputs + "->"
                 sources.append(inputs)
-                target = str(examples["output"][i])  # 需要将字典类型转化为字符串类型
+                target = examples["output"][i]  # 需要将字典类型转化为字符串类型
                 targets.append(target)
 
         tokenizer.pad_token_id = model.generation_config.pad_token_id
