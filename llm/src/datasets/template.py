@@ -1,8 +1,8 @@
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 import tiktoken
-from dataclasses import dataclass
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils import PreTrainedTokenizer
@@ -55,6 +55,8 @@ class Template:
 
         """
         system, history = self._format(query, resp, history, system)
+        # print(f"system==={system}")
+        # print(f"history===={history}")
         encoded_pairs = self._encode(tokenizer, system, history)
         return encoded_pairs
 
@@ -93,12 +95,16 @@ class Template:
         Turn 0: bos + prefix + sep + query    resp + eos
         Turn t: sep + bos + query             resp + eos
         """
+        # __import__("pdb").set_trace()
+
         bos_ids, eos_ids = self._get_special_ids(tokenizer)
         sep_ids = self._convert_inputs_to_ids(tokenizer, context=self.sep)
         encoded_pairs = []
         for turn_idx, (query, resp) in enumerate(history):
+            # print(f"turn_idx={turn_idx},encode_query=={query},encode_response={resp}\n")
             if turn_idx == 0:
                 prefix_ids = self._convert_inputs_to_ids(tokenizer, context=self.prefix, system=system)
+                # print(f"prefix_ids={prefix_ids}")
                 if len(prefix_ids) != 0:  # has prefix
                     prefix_ids = bos_ids + prefix_ids + sep_ids
                 else:
@@ -130,8 +136,10 @@ class Template:
 
         token_ids = []
 
+        # print(f"context==={context}\n,system==={system}\n,query==={query}\n")
         for elem in context:
             if isinstance(elem, str):
+                # print(f"elem==={elem}\n")
                 elem = elem.replace("{{system}}", system, 1) if system is not None else elem
                 elem = elem.replace("{{query}}", query, 1) if query is not None else elem
                 elem = elem.replace("{{idx}}", idx, 1) if idx is not None else elem
@@ -519,3 +527,10 @@ Supports: https://huggingface.co/xverse/XVERSE-13B-Chat
 """
 
 register_template(name="xverse", prefix=["{{system}}"], prompt=["Human: {{query}}\n\nAssistant: "], system="", sep=[])
+
+r"""
+
+Supports: base model template
+
+"""
+register_template(name="base", prefix=[""], prompt=["{{query}}"], system="", sep=["\n"])

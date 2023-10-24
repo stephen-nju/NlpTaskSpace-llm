@@ -3,7 +3,7 @@ from typing import Any, Dict, List
 from llm.src.constant import IGNORE_INDEX
 
 
-def construct_example(examples: Dict[str, List[Any]]):
+def construct_sft_example(examples: Dict[str, List[Any]]):
     for i in range(len(examples["instruction"])):
         instruction, inputs, outputs = examples["instruction"][i], examples["input"][i], examples["output"][i]
         query, response = instruction + inputs + "->", str(outputs)
@@ -18,8 +18,10 @@ def preprocess_supervised_dataset(
 ) -> Dict[str, Any]:
     # build inputs with format `<bos> X Y <eos>` and labels with format `<ignore> ... <ignore> Y <eos>`
     # for multiturn examples, we only mask the prompt part in each prompt-response pair.
+    # __import__("pdb").set_trace()
+
     model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
-    for query, response, history, system in construct_example(examples):
+    for query, response, history, system in construct_sft_example(examples):
         input_ids, labels = [], []
         for turn_idx, (source_ids, target_ids) in enumerate(
             template.encode_multiturn(tokenizer, query, response, history, system)
@@ -44,5 +46,4 @@ def preprocess_supervised_dataset(
         model_inputs["attention_mask"].append([1] * len(input_ids))
         model_inputs["labels"].append(labels)
 
-        
-        return model_inputs
+    return model_inputs

@@ -103,7 +103,7 @@ def report_metric(inputs):
     for example in data:
         ground_truth = example["ground_truth"]
         for truth in ground_truth:
-            e_types_list.append(truth["type"])
+            e_types_list.append(truth["name"])
 
     e_types_list = list(set(e_types_list))
 
@@ -139,7 +139,7 @@ def report_metric(inputs):
         ground_truth = example["ground_truth"]
         for truth in ground_truth:
             # print(ground_truth)
-            type_name = truth["type"]
+            type_name = truth["name"]
             if type_name in e_types_list:
                 # start = truth["start"]
                 # end = truth["end"]
@@ -152,10 +152,10 @@ def report_metric(inputs):
                 boundaries_target_list_dict[type_name].append(span)
                 num_entity += 1
 
-        predict = example["baichuan"]
+        predict = example["target"]
         for ent in predict:
             ent_name = ent["span"].lower()
-            ent_type = ent["type"]
+            ent_type = ent["name"]
             if ent_type in e_types_list:
                 strict_predict_list.append([ent_type, ent_name])
                 boundaries_predict_list.append(ent_name)
@@ -187,12 +187,13 @@ def report_metric(inputs):
     p, r, f1 = print_metrics(tp_ner_strict, fp_ner_strict, fn_ner_strict, "NER-strict-hardMatch")
 
     # per type
-    for key in e_types_list:
-        print_metrics(
-            hard_boundaries[key]["tp"],
-            hard_boundaries[key]["fp"],
-            hard_boundaries[key]["fn"],
-            f"Ner-strict-hardmatch-{key}",
-        )
+    if len(e_types_list) < 5:
+        for key in e_types_list:
+            print_metrics(
+                hard_boundaries[key]["tp"],
+                hard_boundaries[key]["fp"],
+                hard_boundaries[key]["fn"],
+                f"Ner-strict-hardmatch-{key}",
+            )
 
     return f1
