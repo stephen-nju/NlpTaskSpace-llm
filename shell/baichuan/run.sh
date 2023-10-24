@@ -131,7 +131,7 @@ MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 
 # wait
 
-# deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# deepspeed --include=localhost:6,7 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
 # 	--deepspeed ${DS_CONFIG_STAGE_3} \
 # 	--do_train \
 # 	--model_name_or_path ${BAICHUAN2_13B} \
@@ -140,21 +140,50 @@ MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 # 	--overwrite_cache \
 # 	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/train.json \
 # 	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/dev.json \
-# 	--num_train_epochs 2 \
+# 	--num_train_epochs 1 \
 # 	--overwrite_cache \
-# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_2epoch_warmup0_lr2e6 \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_sn_single_task \
 # 	--use_lora true \
 # 	--lora_target W_pack \
 # 	--max_source_length 1024 \
-# 	--max_target_length 128 \
+# 	--max_target_length 1024 \
 # 	--warmup_ratio 0.0 \
 # 	--logging_steps 10 \
 # 	--lr_scheduler_type cosine \
 # 	--per_device_train_batch_size 8 \
 # 	--per_device_eval_batch_size 8 \
-# 	--save_steps 100 \
+# 	--save_steps 200 \
 # 	--save_total_limit=2 \
-# 	--learning_rate 2e-6 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 true \
+# 	--tf32 true
+
+# wait
+
+# deepspeed --include=localhost:6,7 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/train.json \
+# 	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/dev.json \
+# 	--num_train_epochs 1 \
+# 	--overwrite_cache \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_sn_single_task_512 \
+# 	--use_lora true \
+# 	--lora_target W_pack \
+# 	--max_source_length 512 \
+# 	--max_target_length 512 \
+# 	--warmup_ratio 0.0 \
+# 	--logging_steps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 200 \
+# 	--save_total_limit=2 \
+# 	--learning_rate 2e-5 \
 # 	--bf16 true \
 # 	--tf32 true
 
@@ -189,86 +218,335 @@ MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 
 # 下采样测试
 
+# deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/down_sample_1000/train.json \
+# 	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/dev.json \
+# 	--num_train_epochs 1 \
+# 	--overwrite_cache \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_downsample_1000 \
+# 	--use_lora true \
+# 	--lora_target W_pack \
+# 	--max_source_length 1024 \
+# 	--max_target_length 128 \
+# 	--warmup_ratio 0.0 \
+# 	--logging_steps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 100 \
+# 	--save_total_limit=2 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 true \
+# 	--tf32 true
+
+# wait
+
+# deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/down_sample_3000/train.json \
+# 	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/dev.json \
+# 	--num_train_epochs 1 \
+# 	--overwrite_cache \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_downsample_3000 \
+# 	--use_lora true \
+# 	--lora_target W_pack \
+# 	--max_source_length 1024 \
+# 	--max_target_length 128 \
+# 	--warmup_ratio 0.0 \
+# 	--logging_steps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 100 \
+# 	--save_total_limit=2 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 true \
+# 	--tf32 true
+
+# wait
+# # baichuan13b 过拟合数据集
+# deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/overfit/train.json \
+# 	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/dev.json \
+# 	--num_train_epochs 1 \
+# 	--overwrite_cache \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_overfit_1epoch \
+# 	--use_lora true \
+# 	--lora_target W_pack \
+# 	--max_source_length 1024 \
+# 	--max_target_length 128 \
+# 	--warmup_ratio 0.1 \
+# 	--logging_teps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 100 \
+# 	--save_total_limit=2 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 truje \
+# 	--tf32 true
+
+#更新prompt形式V1版本
+# deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/enhance_prompt_v1/train.json \
+# 	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/enhance_prompt_v1/dev.json \
+# 	--num_train_epochs 1 \
+# 	--overwrite_cache \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_enhance_prompt_v1 \
+# 	--use_lora true \
+# 	--lora_target W_pack \
+# 	--max_source_length 1024 \
+# 	--max_target_length 128 \
+# 	--warmup_ratio 0.1 \
+# 	--logging_steps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 100
+# 	--save_total_limit=2 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 true \
+# 	--tf32 true
+
+# 更新prompt形式V2版本
+# deepspeed --include=localhost:2,3 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/merge_general_instruction/train.json \
+# 	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/merge_general_instruction/train.json \
+# 	--num_train_epochs 1 \
+# 	--overwrite_cache \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_merge_instruction \
+# 	--use_lora true \
+# 	--lora_target W_pack \
+# 	--max_source_length 1024 \
+# 	--max_target_length 1024 \
+# 	--warmup_ratio 0.1 \
+# 	--logging_steps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 100 \
+# 	--save_total_limit=2 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 true \
+# 	--tf32 true
+
+# wait
+
+# deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/train.json \
+# 	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/dev.json \
+# 	--num_train_epochs 100 \
+# 	--overwrite_cache \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_overfit_1epoch \
+# 	--use_lora true \
+# 	--lora_target W_pack \
+# 	--max_source_length 1024 \
+# 	--max_target_length 128 \
+# 	--warmup_ratio 0.1 \
+# 	--logging_steps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 10000 \
+# 	--save_total_limit=5 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 true \
+# 	--tf32 true
+
+# 淘宝数据集的任务
+# deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_sft/single_task_tb/single_task_v1/train.json \
+# 	--validation_file /home/zb/train_data/baichuan_sft/single_task_tb/single_task_v1/dev.json \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_tb_single_task \
+# 	--num_train_epochs 1 \
+# 	--overwrite_cache \
+# 	--use_lora true \
+# 	--lora_target W_pack \
+# 	--max_source_length 1024 \
+# 	--max_target_length 1024 \
+# 	--warmup_ratio 0.1 \
+# 	--logging_steps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 500 \
+# 	--save_total_limit=2 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 true \
+# 	--tf32 true
+
+# wait
+
+# deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_sft/single_task_sn_v2/train.json \
+# 	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn_v2/dev.json \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_sn_single_task_v2_new_data \
+# 	--num_train_epochs 1 \
+# 	--overwrite_cache \
+# 	--use_lora true \
+# 	--lora_target W_pack \
+# 	--max_source_length 1024 \
+# 	--max_target_length 1024 \
+# 	--warmup_ratio 0.1 \
+# 	--logging_steps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 200 \
+# 	--save_total_limit=2 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 true \
+# 	--tf32 true
+
+# wait
+# deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_sft/single_task_sn_v2/split_task_v2/train.json \
+# 	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn_v2/split_task_v2/dev.json \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_sn_split_task_v2_new_data \
+# 	--num_train_epochs 1 \
+# 	--overwrite_cache \
+# 	--use_lora true \
+# 	--lora_target W_pack \
+# 	--max_source_length 1024 \
+# 	--max_target_length 1024 \
+# 	--warmup_ratio 0.1 \
+# 	--logging_steps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 200 \
+# 	--save_total_limit=2 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 true \
+# 	--tf32 true
+
+# wait
+
+# deepspeed --include=localhost:0,1,2,3,6,7 --master_port=29503 --hostfile="" task/baichuan/pt_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_pt/query_pretrain/train.json \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_sn_query_pt \
+# 	--num_train_epochs 1 \
+# 	--overwrite_cache \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--block_size 1024 \
+# 	--warmup_ratio 0.1 \
+# 	--logging_steps 100 \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--lr_scheduler_type cosine \
+# 	--save_steps 1000 \
+# 	--save_total_limit=2 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 true \
+# 	--tf32 true
+
+# deepspeed --include=localhost:0,1,4,5,6,7 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_3} \
+# 	--do_train \
+# 	--model_name_or_path ${BAICHUAN2_13B} \
+# 	--report_to tensorboard \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--train_file /home/zb/train_data/baichuan_sft/single_task_sn_v2/merge_single_and_split/train.json \
+# 	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn_v2/split_task_v2/dev.json \
+# 	--output_dir /home/zb/saved_checkpoint/baichuan_13b_sn_v2_merge_single_and_split \
+# 	--num_train_epochs 1 \
+# 	--overwrite_cache \
+# 	--use_lora true \
+# 	--lora_target W_pack \
+# 	--max_source_length 1024 \
+# 	--max_target_length 1024 \
+# 	--warmup_ratio 0.1 \
+# 	--logging_steps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 200 \
+# 	--save_total_limit=2 \
+# 	--learning_rate 2e-5 \
+# 	--bf16 true \
+# 	--tf32 true
+
 deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
 	--deepspeed ${DS_CONFIG_STAGE_3} \
 	--do_train \
-	--model_name_or_path ${BAICHUAN2_13B} \
+	--model_name_or_path /home/zb/saved_checkpoint/baichuan_13b_pt_v1/checkpoint-1000 \
 	--report_to tensorboard \
 	--overwrite_output_dir \
 	--overwrite_cache \
-	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/down_sample_1000/train.json \
-	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/dev.json \
+	--train_file /home/zb/train_data/baichuan_sft/single_task_sn_v2/merge_single_and_split/train.json \
+	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn_v2/split_task_v2/dev.json \
+	--output_dir /home/zb/saved_checkpoint/baichuan_13b_sn_v2_merge_single_and_split \
 	--num_train_epochs 1 \
 	--overwrite_cache \
-	--output_dir /home/zb/saved_checkpoint/baichuan_13b_downsample_1000 \
 	--use_lora true \
 	--lora_target W_pack \
 	--max_source_length 1024 \
-	--max_target_length 128 \
-	--warmup_ratio 0.0 \
-	--logging_steps 10 \
-	--lr_scheduler_type cosine \
-	--per_device_train_batch_size 8 \
-	--per_device_eval_batch_size 8 \
-	--save_steps 100 \
-	--save_total_limit=2 \
-	--learning_rate 2e-5 \
-	--bf16 true \
-	--tf32 true
-
-wait
-
-deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
-	--deepspeed ${DS_CONFIG_STAGE_3} \
-	--do_train \
-	--model_name_or_path ${BAICHUAN2_13B} \
-	--report_to tensorboard \
-	--overwrite_output_dir \
-	--overwrite_cache \
-	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/down_sample_3000/train.json \
-	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/dev.json \
-	--num_train_epochs 1 \
-	--overwrite_cache \
-	--output_dir /home/zb/saved_checkpoint/baichuan_13b_downsample_3000 \
-	--use_lora true \
-	--lora_target W_pack \
-	--max_source_length 1024 \
-	--max_target_length 128 \
-	--warmup_ratio 0.0 \
-	--logging_steps 10 \
-	--lr_scheduler_type cosine \
-	--per_device_train_batch_size 8 \
-	--per_device_eval_batch_size 8 \
-	--save_steps 100 \
-	--save_total_limit=2 \
-	--learning_rate 2e-5 \
-	--bf16 true \
-	--tf32 true
-
-wait
-# baichuan13b 过拟合数据集
-deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" task/baichuan/sft_lora_trainer.py \
-	--deepspeed ${DS_CONFIG_STAGE_3} \
-	--do_train \
-	--model_name_or_path ${BAICHUAN2_13B} \
-	--report_to tensorboard \
-	--overwrite_output_dir \
-	--overwrite_cache \
-	--train_file /home/zb/train_data/baichuan_sft/single_task_sn/overfit/train.json \
-	--validation_file /home/zb/train_data/baichuan_sft/single_task_sn/dev.json \
-	--num_train_epochs 20 \
-	--overwrite_cache \
-	--output_dir /home/zb/saved_checkpoint/baichuan_13b_overfit_20epoch \
-	--use_lora true \
-	--lora_target W_pack \
-	--max_source_length 1024 \
-	--max_target_length 128 \
+	--max_target_length 1024 \
 	--warmup_ratio 0.1 \
 	--logging_steps 10 \
 	--lr_scheduler_type cosine \
 	--per_device_train_batch_size 8 \
 	--per_device_eval_batch_size 8 \
-	--save_steps 100 \
+	--save_steps 200 \
 	--save_total_limit=2 \
 	--learning_rate 2e-5 \
 	--bf16 true \

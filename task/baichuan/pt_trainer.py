@@ -12,9 +12,8 @@ from typing import Optional
 
 import bitsandbytes as bnb
 import torch
-from datasets import load_dataset
-
 import transformers
+from datasets import load_dataset
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -29,7 +28,6 @@ from transformers import (
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
-
 
 logger = logging.getLogger()
 
@@ -218,10 +216,10 @@ class FinetuneArguments:
         else:
             if self.train_file is not None:
                 extension = self.train_file.split(".")[-1]
-                assert extension in ["csv", "json"], "`train_file` should be a csv or a json file."
+                assert extension in ["csv", "json", "txt"], "`train_file` should be a csv or a json file."
             if self.validation_file is not None:
                 extension = self.validation_file.split(".")[-1]
-                assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
+                assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv or a json file."
         if self.val_max_target_length is None:
             self.val_max_target_length = self.max_target_length
 
@@ -421,7 +419,7 @@ def main():
 
     #################数据集处理函数======================================================================
     def tokenize_function(examples):
-        output = tokenizer(examples["input"])
+        output = tokenizer(examples["text"])
         return output
 
     column_names = raw_datasets["train"].column_names
@@ -540,7 +538,11 @@ def main():
 
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
-        trainer.save_state()
+        trainer.save_model()
+        try:
+            tokenizer.save_pretrained(training_args.output_dir)
+        except:
+            logger.warning("Cannot save tokenizer, please copy the files manually.")
 
     # Evaluation
     if training_args.do_eval:

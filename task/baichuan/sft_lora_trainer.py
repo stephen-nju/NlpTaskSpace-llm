@@ -15,19 +15,11 @@ import jieba
 import numpy as np
 import torch
 import torch.nn as nn
+import transformers
 from datasets import load_dataset
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
-from peft import (
-    LoraConfig,
-    PeftModel,
-    TaskType,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-)
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model, prepare_model_for_kbit_training
 from rouge_chinese import Rouge
-
-import transformers
-from llm.src.constant import IGNORE_INDEX
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -43,6 +35,7 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint
 
+from llm.src.constant import IGNORE_INDEX
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils import PreTrainedTokenizer

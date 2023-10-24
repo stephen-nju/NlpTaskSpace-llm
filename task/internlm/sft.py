@@ -16,7 +16,7 @@ from lightning.pytorch.strategies import DeepSpeedStrategy
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from rouge_chinese import Rouge
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -125,7 +125,6 @@ class SupervisedFintuningModule(LightningModule):
 
     def setup(self, stage):
         raw_datasets = load_dataset("json", data_files={"train": self.args.train_data, "dev": self.args.dev_data})
-
         preprocessing_function_train = functools.partial(
             preprocess_supervised_dataset,
             tokenizer=self.tokenizer,
@@ -142,8 +141,6 @@ class SupervisedFintuningModule(LightningModule):
             load_from_cache_file=not self.args.overwrite_cache,
             desc="Running tokenizer on train dataset",
         )
-
-        #
         # self.dev_dataset = raw_datasets["dev"].map(
         #         preprocessing_function_train,
         #         batched=True,
@@ -177,12 +174,13 @@ class SupervisedFintuningModule(LightningModule):
         optimizer = torch.optim.AdamW(optim_groups, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
         num_gpus = self.trainer.num_devices
         # 注：只有在使用pytorch Lightning的LightningDataModule 时候才可以使用该方式回去训练集大小
+        print(f"len train dataloader==={len(self.train_dataloader())}")
         t_total = (
             len(self.train_dataloader()) // (self.trainer.accumulate_grad_batches * num_gpus) + 1
         ) * self.args.max_epochs
         warmup_steps = int(self.args.warmup_proportion * t_total)
 
-        if self.args.lr_scheduler == "onecycle":
+        if self.args.lr_scheduler_type == "onecycle":
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
                 max_lr=self.args.learning_rate,
@@ -192,20 +190,20 @@ class SupervisedFintuningModule(LightningModule):
                 anneal_strategy="linear",
             )
 
-        elif self.args.lr_scheduler == "linear":
+        elif self.args.lr_scheduler_type == "linear":
             scheduler = get_linear_schedule_with_warmup(
                 optimizer,
                 num_warmup_steps=warmup_steps,
                 num_training_steps=t_total,
             )
-        elif self.args.lr_scheduler == "polydecay":
+        elif self.args.lr_scheduler_type == "polydecay":
             scheduler = get_polynomial_decay_schedule_with_warmup(
                 optimizer,
                 warmup_steps,
                 t_total,
                 lr_end=self.args.learning_rate / 4.0,
             )
-        elif self.args.lr_scheduler == "cosine":
+        elif self.args.lr_scheduler_type == "cosine":
             scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, t_total)
 
         else:
@@ -218,24 +216,17 @@ class SupervisedFintuningModule(LightningModule):
             self.model.save_pretrained(save_path)
             self.tokenizer.save_pretrained(save_path)
 
-    def training_step(self, batch, batch_idx):
-        output = self.model(**batch)
-        self.log("lr", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, on_epoch=True)
-        self.log("train_loss", output.loss, on_step=True, prog_bar=True, on_epoch=True)
-
-        return output.loss
-
     # def validation_step(self, batch, batch_idx):
     #     output = self.model(**batch)
     #     self.log("eval_loss", output.loss, on_step=True, on_epoch=True)
 
-    def test_step(self, batch, batch_idx):
-        pass
-        # output = self.model.generate(batch["input_ids"], max_new_tokens=128)
-        # output_text = self.tokenizer.decode(
-        #     output.sequence[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
-        # )
-        # 计算其它指标
+    # def test_step(self, batch, batch_idx):
+    #     pass
+    # output = self.model.generate(batch["input_ids"], max_new_tokens=128)
+    # output_text = self.tokenizer.decode(
+    #     output.sequence[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
+    # )
+    # 计算其它指标
 
     def compute_metrics(self, eval_preds):
         preds, labels = eval_preds
@@ -267,7 +258,7 @@ class SupervisedFintuningModule(LightningModule):
     def train_dataloader(self):
         return DataLoader(
             dataset=self.train_dataset,
-            batch_size=self.args.batch_size,
+            batch_size=self.args.per_device_train_batch_size,
             num_workers=4,
             pin_memory=True,
             collate_fn=DataCollatorForSeq2Seq(
@@ -279,14 +270,19 @@ class SupervisedFintuningModule(LightningModule):
             ),
         )
 
+    def training_step(self, batch, batch_idx):
+        output = self.model(**batch)
+        self.log("lr", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, sync_dist=True)
+        self.log("train_loss", output.loss, on_step=True, prog_bar=True, sync_dist=True)
+        return output.loss
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="train tplinker ner model")
+    parser = argparse.ArgumentParser(description="train llm model")
     parser.add_argument("--output_dir", type=str, default="./output_dir/", help="")
     parser.add_argument("--train_data", type=str, default="", help="train data path")
     parser.add_argument("--test_data", type=str, default="", help="test data path")
     parser.add_argument("--dev_data", type=str, default="", help="dev data path")
-    parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument(
         "--model_name_or_path",
         type=str,
@@ -312,7 +308,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--lr_scheduler",
+        "--lr_scheduler_type",
         choices=["linear", "onecycle", "polydecay", "cosine"],
         default="cosine",
     )
@@ -327,7 +323,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--warmup_proportion",
         default=0.1,
-        type=int,
+        type=float,
         help="warmup steps used for scheduler.",
     )
     parser.add_argument(
@@ -374,12 +370,7 @@ if __name__ == "__main__":
         default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
-    parser.add_argument(
-        "--num_warmup_steps",
-        type=int,
-        default=0,
-        help="Number of steps for the warmup in the lr scheduler.",
-    )
+
     parser.add_argument(
         "--seed",
         type=int,

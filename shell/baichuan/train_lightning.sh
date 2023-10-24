@@ -32,8 +32,9 @@ export DS_CONFIG_STAGE_3=/home/zb/NlpTaskSpace-llm/config/lightning_deepspeed/ze
 
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 
-deepspeed --include=localhost:6,7 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/baichuan/sft_lightning.py \
+deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/baichuan/sft_lightning.py \
 	--deepspeed ${DS_CONFIG_STAGE_3} \
+	--template_name "baichuan2" \
 	--model_name_or_path ${MODEL_PATH} \
 	--train_data ${TRAIN_DATA} \
 	--dev_data ${VALID_DATA} \
