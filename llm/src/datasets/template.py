@@ -530,7 +530,7 @@ register_template(name="xverse", prefix=["{{system}}"], prompt=["Human: {{query}
 
 r"""
 
-Supports: base model template
+Supports: baichuan2 base model template
 
 """
-register_template(name="base", prefix=[""], prompt=["{{query}}"], system="", sep=["\n"])
+register_template(name="baichuan2-base", prefix=[""], prompt=["{{query}}"], system="", sep=["\n"], efficient_eos=True)

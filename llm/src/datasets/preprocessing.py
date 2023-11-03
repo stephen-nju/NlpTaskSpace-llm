@@ -13,7 +13,7 @@ def construct_sft_example(examples: Dict[str, List[Any]]):
         yield query, response, history, system
 
 
-def preprocess_supervised_dataset(
+def preprocess_supervised_dataset_train(
     examples, tokenizer, template, max_source_length, max_target_length
 ) -> Dict[str, Any]:
     # build inputs with format `<bos> X Y <eos>` and labels with format `<ignore> ... <ignore> Y <eos>`
@@ -45,5 +45,41 @@ def preprocess_supervised_dataset(
         model_inputs["input_ids"].append(input_ids)
         model_inputs["attention_mask"].append([1] * len(input_ids))
         model_inputs["labels"].append(labels)
+
+    return model_inputs
+
+
+def preprocess_supervised_dataset_test(
+    examples,
+    tokenizer,
+    template,
+    max_source_length,
+    max_target_length,
+    ignore_pad_token_for_loss=True,
+):
+    pad_token_id = tokenizer.pad_token_id
+    tokenizer.padding_side = "left"
+    sources, targets = [], []
+    for i in range(len(examples["input"])):
+        if examples["input"][i] and examples["output"][i] and examples["instruction"][i]:
+            inputs = examples["input"][i]
+            instruction = examples["instruction"][i]
+            inputs = instruction + inputs
+            sources.append(inputs)
+            target = examples["output"][i]  # 需要将字典类型转化为字符串类型
+            targets.append(target)
+
+    model_inputs = tokenizer(
+        sources,
+        max_length=max_source_length,
+        truncation=True,
+        padding=True,
+    )
+
+    labels = tokenizer(targets, max_length=max_target_length, truncation=True, padding=True)
+    if ignore_pad_token_for_loss:
+        labels["input_ids"] = [[(l if l != pad_token_id else -100) for l in label] for label in labels["input_ids"]]
+
+    model_inputs["labels"] = labels["input_ids"]
 
     return model_inputs
