@@ -10,13 +10,13 @@ export MODEL_PATH=/data/SHARE/MODELS/BAAI/AquilaChat2-34B/
 
 export TEST_DATA=/home/zb/train_data/baichuan_sft/single_task_sn_v2/split_task_v2/test.json
 
-deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/aquila2/sft_deepspeed.py \
+deepspeed --include=localhost:6,7 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/aquila2/sft_deepspeed.py \
 	--deepspeed ${DS_CONFIG_STAGE_2} \
 	--overwrite_cache \
 	--model_name_or_path ${MODEL_PATH} \
-	--output_dir /home/zb/saved_checkpoint/aquila2-sn-v1/ \
-	--train_data /home/zb/suningGit/zb/train_data/sn_generate_gpt_v1_train.json \
-	--dev_data /home/zb/suningGit/zb/train_data/sn_generate_gpt_v1_dev.json \
+	--output_dir /home/zb/saved_checkpoint/aquila2-test \
+	--train_data ${TEST_DATA} \
+	--dev_data ${TEST_DATA} \
 	--max_epochs 1 \
 	--max_source_length 1024 \
 	--max_target_length 1024 \
@@ -24,6 +24,7 @@ deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" --n
 	--per_device_train_batch_size 2 \
 	--per_device_eval_batch_size 2 \
 	--learning_rate 2e-5 \
+	--gradient_accumulation_steps 4 \
 	--save_steps 500 \
 	--use_lora true \
 	--lora_target q_proj,v_proj \

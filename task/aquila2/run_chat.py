@@ -622,6 +622,7 @@ def main():
     )
 
     if args.lora_ckpt_path is not None:
+        print("加载lora模块..................................")
         peft_model = PeftModel.from_pretrained(model, args.lora_ckpt_path)
         model = peft_model.merge_and_unload()
 

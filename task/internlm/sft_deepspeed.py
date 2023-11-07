@@ -56,7 +56,7 @@ class SupervisedFintuningModule(LightningModule):
         )
 
         self.llm_metrics = LanguageModelMetric()
-        self.template = get_template_and_fix_tokenizer("internlm-base", self.tokenizer)
+        self.template = get_template_and_fix_tokenizer("aquila-chat", self.tokenizer)
         self.save_hyperparameters()
 
     def configure_model(self):
@@ -84,11 +84,14 @@ class SupervisedFintuningModule(LightningModule):
             )
 
         else:
+            # 使用bf16 来加载模型
+            self.print(f"model config===\n{self.config}")
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.model_name_or_path,
                 from_tf=bool(".ckpt" in self.args.model_name_or_path),
                 config=self.config,
                 trust_remote_code=True,
+                torch_dtype="auto",
             )
         # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
         # on a small vocab and want a smaller embedding size, remove this test.
@@ -113,8 +116,12 @@ class SupervisedFintuningModule(LightningModule):
             model = prepare_model_for_kbit_training(model)
 
         if self.args.use_lora:
-            if isinstance(self.args.lora_target, str):  # support custom target modules/layers of LoRA
-                lora_target = [target.strip() for target in self.args.lora_target.split(",")]
+            if isinstance(self.args.lora_target, str):
+                if self.args.lora_target == "all":
+                    lora_target = find_all_linear_names(model, self.args.quantization_bit)
+                else:
+                    # support custom target modules/layers of LoRA
+                    lora_target = [target.strip() for target in self.args.lora_target.split(",")]
             ### TODO 添加全量lora 的微调
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
@@ -158,8 +165,8 @@ class SupervisedFintuningModule(LightningModule):
             desc="Running tokenizer on train dataset",
         )
 
-        preprocessing_function_eval = functools.partial(
-            preprocess_supervised_dataset_eval,
+        preprocessing_function_test = functools.partial(
+            preprocess_supervised_dataset_test,
             tokenizer=self.tokenizer,
             template=self.template,
             max_source_length=self.args.max_source_length,
@@ -174,6 +181,15 @@ class SupervisedFintuningModule(LightningModule):
             remove_columns=column_names,
             load_from_cache_file=not self.args.overwrite_cache,
             desc="Running tokenizer on validation dataset",
+        )
+
+        self.test_dataset = raw_datasets["dev"].map(
+            preprocessing_function_test,
+            batched=True,
+            num_proc=self.args.preprocessing_num_workers,
+            remove_columns=column_names,
+            load_from_cache_file=not self.args.overwrite_cache,
+            desc="Running tokenizer on validation dataset for testing",
         )
 
     @property
@@ -483,12 +499,6 @@ if __name__ == "__main__":
         help="If the training should continue from a checkpoint folder.",
     )
     parser.add_argument(
-        "--with_tracking",
-        action="store_true",
-        help="Whether to enable experiment trackers for logging.",
-    )
-
-    parser.add_argument(
         "--low_cpu_mem_usage",
         action="store_true",
         help=(
@@ -518,7 +528,7 @@ if __name__ == "__main__":
         "--quantization_bit",
         type=str,
         default=None,
-        help="quantization training",
+        help="quantization training like 4bit 8bit",
     )
     parser.add_argument("--use_lora", type=bool, default=True, help="using lora")
 
@@ -558,6 +568,7 @@ if __name__ == "__main__":
         dirpath=arg.output_dir,
         every_n_train_steps=arg.save_steps,
         filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
+        save_last=True,
     )
     callbacks.append(checkpoint)
 
@@ -569,8 +580,8 @@ if __name__ == "__main__":
         log_every_n_steps=1,
         num_sanity_val_steps=0,
         default_root_dir=arg.output_dir,
+        accumulate_grad_batches=arg.gradient_accumulation_steps,
     )
-
     trainer.fit(model)
 
     trainer.test(model)

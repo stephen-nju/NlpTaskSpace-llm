@@ -1,3 +1,5 @@
+import json
+from copy import deepcopy
 from typing import Any, Dict, List
 
 from llm.src.constant import IGNORE_INDEX
