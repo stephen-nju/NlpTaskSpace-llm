@@ -1,39 +1,34 @@
-# ----*----coding:utf8-----*----
-
-
 import argparse
 import functools
 import os
+from types import MethodType
 from typing import Any, Dict, Tuple, Union
 
-import jieba
-import numpy as np
 import torch
 from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
-from lightning import LightningDataModule, LightningModule, Trainer, seed_everything
+from lightning import LightningModule, Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.strategies import DeepSpeedStrategy
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from peft import (LoraConfig, TaskType, get_peft_model,
+                  prepare_model_for_kbit_training)
 from rouge_chinese import Rouge
 from torch.utils.data import DataLoader, Dataset
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    DataCollatorForSeq2Seq,
-    DefaultDataCollator,
-    GenerationConfig,
-    get_cosine_schedule_with_warmup,
-    get_linear_schedule_with_warmup,
-    get_polynomial_decay_schedule_with_warmup,
-)
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
+                          BitsAndBytesConfig, DataCollatorForSeq2Seq,
+                          DefaultDataCollator, GenerationConfig,
+                          get_cosine_schedule_with_warmup,
+                          get_linear_schedule_with_warmup,
+                          get_polynomial_decay_schedule_with_warmup)
 
+from llm.src.callbacks import HFModelCheckpoint
 from llm.src.constant import IGNORE_INDEX
-from llm.src.datasets.preprocessing import preprocess_supervised_dataset_eval, preprocess_supervised_dataset_train
-from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
+from llm.src.datasets.preprocessing import (
+    preprocess_supervised_dataset_test, preprocess_supervised_dataset_train)
+from llm.src.datasets.template import (get_template_and_fix_tokenizer,
+                                       register_template)
+from llm.src.utils import find_all_linear_names
 from metrics.language_model import LanguageModelMetric
 
 r"""
@@ -114,6 +109,24 @@ class SupervisedFintuningModule(LightningModule):
         if self.args.quantization_bit is not None:
             # 启用模型量化需要开启
             model = prepare_model_for_kbit_training(model)
+
+        # Set NEFTune trick for fine-tuning
+        if self.args.neft_alpha > 0:
+            input_embed = model.get_input_embeddings()
+            if isinstance(input_embed, torch.nn.Embedding):
+
+                def noisy_forward(self: torch.nn.Embedding, x: torch.Tensor) -> torch.Tensor:
+                    embeddings = input_embed.__class__.forward(self, x)
+                    dims = self.num_embeddings * self.embedding_dim
+                    mag_norm = self.args.neft_alpha / (dims**0.5)
+                    embeddings += torch.zeros_like(embeddings).uniform_(-mag_norm, mag_norm)
+                    return embeddings
+
+                # 将方法绑定到forward上,参考medicalGPT
+                input_embed.forward = MethodType(noisy_forward, input_embed)
+                self.log("Using noisy embedding with alpha={:.2f}".format(self.args.neft_alpha))
+            else:
+                self.log("Input embeddings are not normal nn.Embedding, cannot transform into noisy embedding.")
 
         if self.args.use_lora:
             if isinstance(self.args.lora_target, str):
@@ -340,17 +353,8 @@ class SupervisedFintuningModule(LightningModule):
 
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         if self.global_rank == 0:
-            save_path = os.path.join(self.args.output_dir, "hf_model")
-            self.model.save_pretrained(save_path)
+            save_path = os.path.join(self.args.output_dir, "hf_tokenizer")
             self.tokenizer.save_pretrained(save_path)
-
-    # def test_step(self, batch, batch_idx):
-    #     pass
-    # output = self.model.generate(batch["input_ids"], max_new_tokens=128)
-    # output_text = self.tokenizer.decode(
-    #     output.sequence[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
-    # )
-    # 计算其它指标
 
 
 if __name__ == "__main__":
@@ -518,6 +522,12 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--neft-alpha",
+        type=float,
+        default=0,
+        help="The alpha parameter to control the noise magnitude in NEFTune. value can be 5.",
+    )
+    parser.add_argument(
         "--ignore_pad_token_for_loss",
         type=bool,
         default=True,
@@ -563,12 +573,13 @@ if __name__ == "__main__":
 
     # 添加常用的checkpoint
     callbacks = []
-    checkpoint = ModelCheckpoint(
+    checkpoint = HFModelCheckpoint(
         monitor="train_loss",
         dirpath=arg.output_dir,
         every_n_train_steps=arg.save_steps,
         filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
         save_last=True,
+        save_hf=True,
     )
     callbacks.append(checkpoint)
 

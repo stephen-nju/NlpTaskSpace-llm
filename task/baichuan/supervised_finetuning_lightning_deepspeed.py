@@ -1,37 +1,44 @@
 # ----*----coding:utf8-----*----
 
+
 import argparse
 import functools
 import os
-from typing import Any, Dict
+from types import MethodType
+from typing import Any, Dict, Tuple, Union
 
-import jieba
-import numpy as np
 import torch
 from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
-from lightning import LightningDataModule, LightningModule, Trainer, seed_everything
+from lightning import LightningModule, Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.strategies import DeepSpeedStrategy
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from rouge_chinese import Rouge
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
     DataCollatorForSeq2Seq,
+    DefaultDataCollator,
     GenerationConfig,
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup,
 )
 
+from llm.src.callbacks import HFModelCheckpoint
 from llm.src.constant import IGNORE_INDEX
-from llm.src.datasets.preprocessing import preprocess_supervised_dataset
-from llm.src.datasets.template import get_template_and_fix_tokenizer
+from llm.src.datasets.preprocessing import (
+    preprocess_supervised_dataset_test,
+    preprocess_supervised_dataset_train,
+)
+from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
+from llm.src.utils import find_all_linear_names
+from metrics.language_model import LanguageModelMetric
 
 
 class SupervisedFintuningModule(LightningModule):
@@ -45,7 +52,12 @@ class SupervisedFintuningModule(LightningModule):
             use_fast=not args.use_slow_tokenizer,
             trust_remote_code=True,
         )
-        self.template = get_template_and_fix_tokenizer(self.args.template_name, self.tokenizer)
+
+        self.llm_metrics = LanguageModelMetric()
+        self.template = get_template_and_fix_tokenizer("baichuan2", self.tokenizer)
+        self.save_hyperparameters()
+
+    def configure_model(self):
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
             if self.args.quantization_bit == "4bit":
@@ -70,11 +82,14 @@ class SupervisedFintuningModule(LightningModule):
             )
 
         else:
+            # 使用bf16 来加载模型
+            self.print(f"model config===\n{self.config}")
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.model_name_or_path,
                 from_tf=bool(".ckpt" in self.args.model_name_or_path),
                 config=self.config,
                 trust_remote_code=True,
+                torch_dtype="auto",
             )
         # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
         # on a small vocab and want a smaller embedding size, remove this test.
@@ -98,9 +113,31 @@ class SupervisedFintuningModule(LightningModule):
             # 启用模型量化需要开启
             model = prepare_model_for_kbit_training(model)
 
+        # Set NEFTune trick for fine-tuning
+        if self.args.neft_alpha > 0:
+            input_embed = model.get_input_embeddings()
+            if isinstance(input_embed, torch.nn.Embedding):
+
+                def noisy_forward(self: torch.nn.Embedding, x: torch.Tensor) -> torch.Tensor:
+                    embeddings = input_embed.__class__.forward(self, x)
+                    dims = self.num_embeddings * self.embedding_dim
+                    mag_norm = self.args.neft_alpha / (dims**0.5)
+                    embeddings += torch.zeros_like(embeddings).uniform_(-mag_norm, mag_norm)
+                    return embeddings
+
+                # 将方法绑定到forward上,参考medicalGPT
+                input_embed.forward = MethodType(noisy_forward, input_embed)
+                self.log("Using noisy embedding with alpha={:.2f}".format(self.args.neft_alpha))
+            else:
+                self.log("Input embeddings are not normal nn.Embedding, cannot transform into noisy embedding.")
+
         if self.args.use_lora:
-            if isinstance(self.args.lora_target, str):  # support custom target modules/layers of LoRA
-                lora_target = [target.strip() for target in self.args.lora_target.split(",")]
+            if isinstance(self.args.lora_target, str):
+                if self.args.lora_target == "all":
+                    lora_target = find_all_linear_names(model, self.args.quantization_bit)
+                else:
+                    # support custom target modules/layers of LoRA
+                    lora_target = [target.strip() for target in self.args.lora_target.split(",")]
             ### TODO 添加全量lora 的微调
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
@@ -120,14 +157,15 @@ class SupervisedFintuningModule(LightningModule):
             model.print_trainable_parameters()
 
         self.model = model
+        self.generation_config = model.generation_config
+        # __import__("pprint").pprint(self.generation_config)
+
         self.model.print_trainable_parameters()
-        self.save_hyperparameters()
 
     def setup(self, stage):
         raw_datasets = load_dataset("json", data_files={"train": self.args.train_data, "dev": self.args.dev_data})
-
         preprocessing_function_train = functools.partial(
-            preprocess_supervised_dataset,
+            preprocess_supervised_dataset_train,
             tokenizer=self.tokenizer,
             template=self.template,
             max_source_length=self.args.max_source_length,
@@ -143,15 +181,32 @@ class SupervisedFintuningModule(LightningModule):
             desc="Running tokenizer on train dataset",
         )
 
-        #
-        # self.dev_dataset = raw_datasets["dev"].map(
-        #         preprocessing_function_train,
-        #         batched=True,
-        #         num_proc=finetune_args.preprocessing_num_workers,
-        #         remove_columns=column_names,
-        #         load_from_cache_file=not finetune_args.overwrite_cache,
-        #         desc="Running tokenizer on train dataset",
-        #     )
+        preprocessing_function_test = functools.partial(
+            preprocess_supervised_dataset_test,
+            tokenizer=self.tokenizer,
+            template=self.template,
+            max_source_length=self.args.max_source_length,
+            max_target_length=self.args.max_target_length,
+            ignore_pad_token_for_loss=True,
+        )
+
+        self.dev_dataset = raw_datasets["dev"].map(
+            preprocessing_function_train,
+            batched=True,
+            num_proc=self.args.preprocessing_num_workers,
+            remove_columns=column_names,
+            load_from_cache_file=not self.args.overwrite_cache,
+            desc="Running tokenizer on validation dataset",
+        )
+
+        self.test_dataset = raw_datasets["dev"].map(
+            preprocessing_function_test,
+            batched=True,
+            num_proc=self.args.preprocessing_num_workers,
+            remove_columns=column_names,
+            load_from_cache_file=not self.args.overwrite_cache,
+            desc="Running tokenizer on validation dataset for testing",
+        )
 
     @property
     def deepspeed_offload(self) -> bool:
@@ -160,6 +215,88 @@ class SupervisedFintuningModule(LightningModule):
             config = strategy.config["zero_optimization"]
             return config.get("offload_optimizer") or config.get("offload_param")
         return False
+
+    @property
+    def is_deepspeed_zero3_enabled(self):
+        strategy = self.trainer.strategy
+        if isinstance(strategy, DeepSpeedStrategy):
+            config = strategy.config["zero_optimization"]
+            return config.get("stage") == 3
+
+    def train_dataloader(self):
+        return DataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            num_workers=4,
+            pin_memory=True,
+            collate_fn=DataCollatorForSeq2Seq(
+                self.tokenizer,
+                label_pad_token_id=IGNORE_INDEX if self.args.ignore_pad_token_for_loss else self.tokenizer.pad_token_id,
+                pad_to_multiple_of=8,
+                return_tensors="pt",
+                padding=True,
+            ),
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            dataset=self.dev_dataset,
+            batch_size=self.args.per_device_eval_batch_size,
+            num_workers=4,
+            pin_memory=True,
+            collate_fn=DataCollatorForSeq2Seq(
+                self.tokenizer,
+                label_pad_token_id=IGNORE_INDEX if self.args.ignore_pad_token_for_loss else self.tokenizer.pad_token_id,
+                pad_to_multiple_of=8,
+                return_tensors="pt",
+                padding=True,
+            ),
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            dataset=self.dev_dataset,
+            batch_size=self.args.per_device_eval_batch_size,
+            num_workers=4,
+            pin_memory=True,
+            collate_fn=DataCollatorForSeq2Seq(
+                self.tokenizer,
+                label_pad_token_id=IGNORE_INDEX if self.args.ignore_pad_token_for_loss else self.tokenizer.pad_token_id,
+                pad_to_multiple_of=8,
+                return_tensors="pt",
+                padding=True,
+            ),
+        )
+
+    def training_step(self, batch, batch_idx):
+        output = self.model(**batch)
+        self.log("lr", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, sync_dist=True)
+        self.log("train_loss", output.loss, on_step=True, prog_bar=True, sync_dist=True)
+        return output.loss
+
+    def validation_step(self, batch, batch_idx):
+        output = self.model(**batch)
+        self.log("eval_loss", output.loss, prog_bar=True, sync_dist=True)
+
+    def test_step(self, batch, batch_idx):
+        # deepspeed zero3 cause inflight param when using model.generate
+        synced_gpus = True if self.is_deepspeed_zero3_enabled else False
+        preds = self.model.generate(**batch, max_new_tokens=128, synced_gpus=synced_gpus)
+        # print(f"preds.shape=={preds.shape}")
+        self.llm_metrics.update(preds, batch["labels"])
+
+    def on_test_epoch_end(self):
+        score_dict = self.llm_metrics.compute(
+            self.tokenizer, ignore_pad_token_for_loss=True, global_rank=self.global_rank
+        )
+        # score_dict = {"rouge-1": [], "rouge-2": [], "rouge-l": [], "bleu-4": []}
+        # print(score_dict)
+        self.log("rouge-1", score_dict["rouge-1"], sync_dist=True)
+        self.log("rouge-2", score_dict["rouge-2"], sync_dist=True)
+        self.log("rouge-l", score_dict["rouge-l"], sync_dist=True)
+        self.log("bleu-4", score_dict["bleu-4"], sync_dist=True)
+
+        self.llm_metrics.reset()
 
     def configure_optimizers(self):
         no_decay = ["bias", "LayerNorm.weight"]
@@ -175,14 +312,19 @@ class SupervisedFintuningModule(LightningModule):
             optimizer = DeepSpeedCPUAdam(optim_groups, lr=self.args.learning_rate, eps=self.arsg.adam_epsilon)
 
         optimizer = torch.optim.AdamW(optim_groups, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
-        num_gpus = self.trainer.num_devices
-        # 注：只有在使用pytorch Lightning的LightningDataModule 时候才可以使用该方式回去训练集大小
-        t_total = (
-            len(self.train_dataloader()) // (self.trainer.accumulate_grad_batches * num_gpus) + 1
-        ) * self.args.max_epochs
-        warmup_steps = int(self.args.warmup_proportion * t_total)
+        # num_gpus = self.trainer.num_devices
+        # # 注：只有在使用pytorch Lightning的LightningDataModule 时候才可以使用该方式回去训练集大小
+        # # print(f"len train dataloader==={len(self.train_dataloader())}")
 
-        if self.args.lr_scheduler == "onecycle":
+        # t_total = (
+        #     len(self.train_dataloader()) // (self.trainer.accumulate_grad_batches * num_gpus) + 1
+        # ) * self.args.max_epochs
+
+        t_total = self.trainer.estimated_stepping_batches
+        warmup_steps = int(self.args.warmup_proportion * t_total)
+        # print(f"totla={t_total},step_batch={stepping_batches},w={warmup_steps},warm_up=={warmup_steps}")
+
+        if self.args.lr_scheduler_type == "onecycle":
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
                 max_lr=self.args.learning_rate,
@@ -192,20 +334,20 @@ class SupervisedFintuningModule(LightningModule):
                 anneal_strategy="linear",
             )
 
-        elif self.args.lr_scheduler == "linear":
+        elif self.args.lr_scheduler_type == "linear":
             scheduler = get_linear_schedule_with_warmup(
                 optimizer,
                 num_warmup_steps=warmup_steps,
                 num_training_steps=t_total,
             )
-        elif self.args.lr_scheduler == "polydecay":
+        elif self.args.lr_scheduler_type == "polydecay":
             scheduler = get_polynomial_decay_schedule_with_warmup(
                 optimizer,
                 warmup_steps,
                 t_total,
                 lr_end=self.args.learning_rate / 4.0,
             )
-        elif self.args.lr_scheduler == "cosine":
+        elif self.args.lr_scheduler_type == "cosine":
             scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, t_total)
 
         else:
@@ -214,89 +356,26 @@ class SupervisedFintuningModule(LightningModule):
 
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         if self.global_rank == 0:
-            save_path = os.path.join(self.args.output_dir, "hf_model")
-            self.model.save_pretrained(save_path)
+            save_path = os.path.join(self.args.output_dir, "hf_tokenizer")
             self.tokenizer.save_pretrained(save_path)
-
-    def training_step(self, batch, batch_idx):
-        output = self.model(**batch)
-        self.log("lr", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, on_epoch=True)
-        self.log("train_loss", output.loss, on_step=True, prog_bar=True, on_epoch=True)
-
-        return output.loss
-
-    # def validation_step(self, batch, batch_idx):
-    #     output = self.model(**batch)
-    #     self.log("eval_loss", output.loss, on_step=True, on_epoch=True)
-
-    def test_step(self, batch, batch_idx):
-        pass
-        # output = self.model.generate(batch["input_ids"], max_new_tokens=128)
-        # output_text = self.tokenizer.decode(
-        #     output.sequence[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
-        # )
-        # 计算其它指标
-
-    def compute_metrics(self, eval_preds):
-        preds, labels = eval_preds
-        if isinstance(preds, tuple):
-            preds = preds[0]
-        decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True)
-        if self.args.ignore_pad_token_for_loss:
-            # Replace -100 in the labels as we can't decode them.
-            labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
-        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-        score_dict = {"rouge-1": [], "rouge-2": [], "rouge-l": [], "bleu-4": []}
-        for pred, label in zip(decoded_preds, decoded_labels):
-            hypothesis = list(jieba.cut(pred))
-            reference = list(jieba.cut(label))
-            rouge = Rouge()
-            scores = rouge.get_scores(" ".join(hypothesis), " ".join(reference))
-            result = scores[0]
-
-            for k, v in result.items():
-                score_dict[k].append(round(v["f"] * 100, 4))
-            bleu_score = sentence_bleu([list(label)], list(pred), smoothing_function=SmoothingFunction().method3)
-            score_dict["bleu-4"].append(round(bleu_score * 100, 4))
-
-        for k, v in score_dict.items():
-            score_dict[k] = float(np.mean(v))
-        return score_dict
-
-    def train_dataloader(self):
-        return DataLoader(
-            dataset=self.train_dataset,
-            batch_size=self.args.batch_size,
-            num_workers=4,
-            pin_memory=True,
-            collate_fn=DataCollatorForSeq2Seq(
-                self.tokenizer,
-                label_pad_token_id=IGNORE_INDEX if self.args.ignore_pad_token_for_loss else self.tokenizer.pad_token_id,
-                pad_to_multiple_of=8,
-                return_tensors="pt",
-                padding=True,
-            ),
-        )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="train tplinker ner model")
-    parser.add_argument("--output_dir", type=str, default="./output_dir/", help="")
-    parser.add_argument("--train_data", type=str, default="", help="train data path")
+    parser = argparse.ArgumentParser(description="train llm model")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./output_dir/",
+        help="path to save model and checkpoint .it is the root dir",
+    )
+
+    parser.add_argument("--train_data", type=str, default="", help="the input train file or train data directory")
     parser.add_argument("--test_data", type=str, default="", help="test data path")
     parser.add_argument("--dev_data", type=str, default="", help="dev data path")
-    parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument(
         "--model_name_or_path",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=False,
-    )
-    parser.add_argument(
-        "--template_name",
-        type=str,
-        help="template name",
         required=True,
     )
     parser.add_argument("--deepspeed", type=str, default=None, help="deepspeed config file path")
@@ -312,7 +391,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--lr_scheduler",
+        "--lr_scheduler_type",
         choices=["linear", "onecycle", "polydecay", "cosine"],
         default="cosine",
     )
@@ -327,7 +406,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--warmup_proportion",
         default=0.1,
-        type=int,
+        type=float,
         help="warmup steps used for scheduler.",
     )
     parser.add_argument(
@@ -374,12 +453,7 @@ if __name__ == "__main__":
         default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
-    parser.add_argument(
-        "--num_warmup_steps",
-        type=int,
-        default=0,
-        help="Number of steps for the warmup in the lr scheduler.",
-    )
+
     parser.add_argument(
         "--seed",
         type=int,
@@ -432,12 +506,6 @@ if __name__ == "__main__":
         help="If the training should continue from a checkpoint folder.",
     )
     parser.add_argument(
-        "--with_tracking",
-        action="store_true",
-        help="Whether to enable experiment trackers for logging.",
-    )
-
-    parser.add_argument(
         "--low_cpu_mem_usage",
         action="store_true",
         help=(
@@ -457,6 +525,12 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--neft-alpha",
+        type=float,
+        default=0,
+        help="The alpha parameter to control the noise magnitude in NEFTune. value can be 5.",
+    )
+    parser.add_argument(
         "--ignore_pad_token_for_loss",
         type=bool,
         default=True,
@@ -467,7 +541,7 @@ if __name__ == "__main__":
         "--quantization_bit",
         type=str,
         default=None,
-        help="quantization training",
+        help="quantization training like 4bit 8bit",
     )
     parser.add_argument("--use_lora", type=bool, default=True, help="using lora")
 
@@ -502,7 +576,14 @@ if __name__ == "__main__":
 
     # 添加常用的checkpoint
     callbacks = []
-    checkpoint = ModelCheckpoint(dirpath=arg.output_dir, every_n_train_steps=arg.save_steps, save_last=True)
+    checkpoint = HFModelCheckpoint(
+        monitor="train_loss",
+        dirpath=arg.output_dir,
+        every_n_train_steps=arg.save_steps,
+        filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
+        save_last=True,
+        save_hf=True,
+    )
     callbacks.append(checkpoint)
 
     trainer = Trainer(
@@ -511,7 +592,10 @@ if __name__ == "__main__":
         strategy=strategy,
         callbacks=callbacks,
         log_every_n_steps=1,
+        num_sanity_val_steps=0,
         default_root_dir=arg.output_dir,
+        accumulate_grad_batches=arg.gradient_accumulation_steps,
     )
-
     trainer.fit(model)
+
+    trainer.test(model)
