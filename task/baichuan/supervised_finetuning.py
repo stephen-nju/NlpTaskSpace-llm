@@ -175,7 +175,7 @@ class DataArguments:
 
 @dataclass
 class ScriptArguments:
-    use_peft: bool = field(default=True, metadata={"help": "Whether to use peft"})
+    use_lora: bool = field(default=True, metadata={"help": "Whether to use peft"})
     target_modules: Optional[str] = field(default="all")
     lora_rank: Optional[int] = field(default=8)
     lora_dropout: Optional[float] = field(default=0.05)
@@ -184,7 +184,7 @@ class ScriptArguments:
     peft_path: Optional[str] = field(default=None, metadata={"help": "The path to the peft model"})
     qlora: bool = field(default=False, metadata={"help": "Whether to use qlora"})
     model_max_length: int = field(
-        default=512,
+        default=2048,
         metadata={"help": "Maximum model context length. suggest: 8192 * 4, 8192 * 2, 8192, 4096, 2048, 1024, 512"},
     )
 
@@ -915,31 +915,22 @@ def main():
         input_ids_list = []
         attention_mask_list = []
         targets_list = []
-        roles = ["human", "gpt"]
 
         def get_dialog(examples):
-            for i, source in enumerate(examples["conversations"]):
-                if len(source) < 2:
-                    continue
-                data_role = source[0].get("from", "")
-                if data_role not in roles or data_role != roles[0]:
-                    # Skip the first one if it is not from human
-                    source = source[1:]
-                if len(source) < 2:
-                    continue
-                messages = []
-                for j, sentence in enumerate(source):
-                    data_role = sentence.get("from", "")
-                    if data_role not in roles:
-                        logger.warning(f"unknown role: {data_role}, {i}. (ignored)")
-                        break
-                    if data_role == roles[j % 2]:
-                        messages.append(sentence["value"])
-                if len(messages) % 2 != 0:
-                    continue
-                # Convert the list to pairs of elements
-                history_messages = [[messages[k], messages[k + 1]] for k in range(0, len(messages), 2)]
-                yield prompt_template.get_dialog(history_messages)
+            for i in range(len(examples["instruction"])):
+                instruction, inputs, outputs = examples["instruction"][i], examples["input"][i], examples["output"][i]
+                if inputs and isinstance(inputs, str):
+                    query = instruction + "\n" + inputs
+                else:
+                    query = instruction
+                history = examples["history"][i] if "history" in examples else None
+            messages = []
+            if history is not None and isinstance(history, list):
+                history.append([query, outputs])
+                messages = history
+            else:
+                messages.append([query, outputs])
+                yield prompt_template.get_dialog(messages)
 
         for dialog in get_dialog(examples):
             input_ids, labels = [], []
@@ -1109,7 +1100,7 @@ def main():
             load_in_4bit=load_in_4bit,
             load_in_8bit=load_in_8bit,
             low_cpu_mem_usage=(not is_deepspeed_zero3_enabled()),
-            device_map=model_args.device_map,
+            # device_map=model_args.device_map,
             trust_remote_code=model_args.trust_remote_code,
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=load_in_4bit,
@@ -1140,7 +1131,7 @@ def main():
                 logger.warning("Input embeddings are not normal nn.Embedding, cannot transform into noisy embedding.")
     else:
         raise ValueError("Error, model_name_or_path is None, SFT must be loaded from a pre-trained model")
-    if script_args.use_peft:
+    if script_args.use_lora:
         logger.info("Fine-tuning method: LoRA(PEFT)")
         if script_args.peft_path is not None:
             logger.info(f"Peft from pre-trained model: {script_args.peft_path}")
