@@ -17,6 +17,3 @@ def find_all_linear_names(model, quantization_bits):
                 lora_module_names.remove("lm_head")
 
     return list(lora_module_names)
-
-
-

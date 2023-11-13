@@ -8,8 +8,8 @@ from llm.src.constant import IGNORE_INDEX
 def construct_sft_example(examples: Dict[str, List[Any]]):
     for i in range(len(examples["instruction"])):
         instruction, inputs, outputs = examples["instruction"][i], examples["input"][i], examples["output"][i]
-        query, response = instruction + inputs + "->", str(outputs)
-        query = query + "\n" + examples["query"][i] if "query" in examples and examples["query"][i] else query
+        query, response = instruction, str(outputs)
+        query = query + "\n" + inputs if inputs else query
         history = examples["history"][i] if "history" in examples else None
         system = examples["system"][i] if "system" in examples else None
         yield query, response, history, system

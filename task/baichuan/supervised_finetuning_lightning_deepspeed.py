@@ -46,7 +46,6 @@ class SupervisedFintuningModule(LightningModule):
         super().__init__()
         self.args = args
         # 加载模型
-        self.config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(
             args.model_name_or_path,
             use_fast=not args.use_slow_tokenizer,
@@ -58,6 +57,8 @@ class SupervisedFintuningModule(LightningModule):
         self.save_hyperparameters()
 
     def configure_model(self):
+        self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
+
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
             if self.args.quantization_bit == "4bit":
@@ -83,7 +84,7 @@ class SupervisedFintuningModule(LightningModule):
 
         else:
             # 使用bf16 来加载模型
-            self.print(f"model config===\n{self.config}")
+            print(f"model config===\n{self.config}")
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.model_name_or_path,
                 from_tf=bool(".ckpt" in self.args.model_name_or_path),
@@ -99,7 +100,6 @@ class SupervisedFintuningModule(LightningModule):
         #     model.resize_token_embeddings(len(tokenizer))
 
         # model.supports_gradient_checkpointing = True  #
-
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
 
@@ -162,6 +162,19 @@ class SupervisedFintuningModule(LightningModule):
 
         self.model.print_trainable_parameters()
 
+    def print_example(self, example):
+        print("input_ids:\n{}".format(example["input_ids"]))
+        print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
+        print("label_ids:\n{}".format(example["labels"]))
+        print(
+            "labels:\n{}".format(
+                self.tokenizer.decode(
+                    [d if d != IGNORE_INDEX else self.tokenizer.pad_token_id for d in example["labels"]],
+                    skip_special_tokens=False,
+                )
+            )
+        )
+
     def setup(self, stage):
         raw_datasets = load_dataset("json", data_files={"train": self.args.train_data, "dev": self.args.dev_data})
         preprocessing_function_train = functools.partial(
@@ -180,6 +193,8 @@ class SupervisedFintuningModule(LightningModule):
             load_from_cache_file=not self.args.overwrite_cache,
             desc="Running tokenizer on train dataset",
         )
+
+        self.print_example(self.train_dataset[0])
 
         preprocessing_function_test = functools.partial(
             preprocess_supervised_dataset_test,

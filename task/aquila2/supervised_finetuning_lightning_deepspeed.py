@@ -14,26 +14,23 @@ from lightning import LightningModule, Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.strategies import DeepSpeedStrategy
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from peft import (LoraConfig, TaskType, get_peft_model,
+                  prepare_model_for_kbit_training)
 from rouge_chinese import Rouge
 from torch.utils.data import DataLoader, Dataset
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    DataCollatorForSeq2Seq,
-    DefaultDataCollator,
-    GenerationConfig,
-    get_cosine_schedule_with_warmup,
-    get_linear_schedule_with_warmup,
-    get_polynomial_decay_schedule_with_warmup,
-)
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
+                          BitsAndBytesConfig, DataCollatorForSeq2Seq,
+                          DefaultDataCollator, GenerationConfig,
+                          get_cosine_schedule_with_warmup,
+                          get_linear_schedule_with_warmup,
+                          get_polynomial_decay_schedule_with_warmup)
 
 from llm.src.callbacks import HFModelCheckpoint
 from llm.src.constant import IGNORE_INDEX
-from llm.src.datasets.preprocessing import preprocess_supervised_dataset_test, preprocess_supervised_dataset_train
-from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
+from llm.src.datasets.preprocessing import (
+    preprocess_supervised_dataset_test, preprocess_supervised_dataset_train)
+from llm.src.datasets.template import (get_template_and_fix_tokenizer,
+                                       register_template)
 from llm.src.utils import find_all_linear_names
 from metrics.language_model import LanguageModelMetric
 
