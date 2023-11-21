@@ -1,6 +1,3 @@
-# ----*----coding:utf8-----*----
-
-
 import argparse
 import functools
 import os
@@ -32,31 +29,10 @@ from transformers import (
 
 from llm.src.callbacks import HFModelCheckpoint
 from llm.src.constant import IGNORE_INDEX
-from llm.src.datasets.preprocessing import (
-    preprocess_supervised_dataset_test,
-    preprocess_supervised_dataset_train,
-)
+from llm.src.datasets.preprocessing import preprocess_supervised_dataset_test, preprocess_supervised_dataset_train
 from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
 from llm.src.utils import find_all_linear_names
 from metrics.language_model import LanguageModelMetric
-
-r"""
-为当前的任务注册模板
-"""
-
-
-register_template(
-    name="aquila-chat",
-    prefix=["{{system}}"],
-    prompt=["Human: {{query}}###Assistant:"],
-    system=(
-        "A chat between a curious human and an artificial intelligence assistant. "
-        "The assistant gives helpful, detailed, and polite answers to the human's questions."
-    ),
-    sep=["###"],
-    stop_words=["</s>"],
-    efficient_eos=True,
-)
 
 
 class SupervisedFintuningModule(LightningModule):
@@ -71,11 +47,10 @@ class SupervisedFintuningModule(LightningModule):
         )
 
         self.llm_metrics = LanguageModelMetric()
-        self.template = get_template_and_fix_tokenizer("aquila-chat", self.tokenizer)
+        self.template = get_template_and_fix_tokenizer("default", self.tokenizer)
         self.save_hyperparameters()
 
-        # def configure_model(self):
-
+    def configure_model(self):
         self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
@@ -599,7 +574,7 @@ if __name__ == "__main__":
         "--lora_target",
         type=str,
         default=None,
-        help="lora ",
+        help='Baichuan choices: ["W_pack", "o_proj", "gate_proj", "up_proj", "down_proj"]',
     )
     parser.add_argument("--lora_ckpt_path", type=str, default=None, help="")
     arg = parser.parse_args()
@@ -639,4 +614,4 @@ if __name__ == "__main__":
     )
     trainer.fit(model)
 
-    # trainer.test(model)
+    trainer.test(model)

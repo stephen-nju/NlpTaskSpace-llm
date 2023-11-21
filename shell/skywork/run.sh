@@ -6,7 +6,7 @@ export DS_CONFIG_STAGE_3=/home/zb/NlpTaskSpace-llm/config/lightning_deepspeed/ze
 export DS_CONFIG_STAGE_2=/home/zb/NlpTaskSpace-llm/config/lightning_deepspeed/zero_stage2_config.json
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 
-export MODEL_PATH=/data/SHARE/MODELS/InternLM/Shanghai_AI_Laboratory/internlm-20b/
+export MODEL_PATH=/data/SHARE/MODELS/SkyWork/Skywork-13B-base/
 
 deepspeed --include=localhost:2,3 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/internlm/supervised_finetuning_lightning_deepspeed.py \
 	--deepspeed ${DS_CONFIG_STAGE_2} \

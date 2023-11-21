@@ -1,41 +1,56 @@
+# ----*----coding:utf8-----*---
+
+
 import argparse
 import functools
 import os
 from types import MethodType
 from typing import Any, Dict, Tuple, Union
 
+import datasets
 import torch
 from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning import LightningModule, Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.strategies import DeepSpeedStrategy
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
-from peft import (LoraConfig, TaskType, get_peft_model,
-                  prepare_model_for_kbit_training)
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from rouge_chinese import Rouge
 from torch.utils.data import DataLoader, Dataset
-from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
-                          BitsAndBytesConfig, DataCollatorForSeq2Seq,
-                          DefaultDataCollator, GenerationConfig,
-                          get_cosine_schedule_with_warmup,
-                          get_linear_schedule_with_warmup,
-                          get_polynomial_decay_schedule_with_warmup)
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    DataCollatorForSeq2Seq,
+    get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+    get_polynomial_decay_schedule_with_warmup,
+)
 
 from llm.src.callbacks import HFModelCheckpoint
 from llm.src.constant import IGNORE_INDEX
-from llm.src.datasets.preprocessing import (
-    preprocess_supervised_dataset_test, preprocess_supervised_dataset_train)
-from llm.src.datasets.template import (get_template_and_fix_tokenizer,
-                                       register_template)
+from llm.src.datasets.preprocessing import preprocess_supervised_dataset_test, preprocess_supervised_dataset_train
+from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
 from llm.src.utils import find_all_linear_names
 from metrics.language_model import LanguageModelMetric
 
-r"""
-为当前的任务注册模板
-"""
-
-register_template(name="internlm-base", prefix=[""], prompt=["{{query}}"], system="", sep=["\n"], efficient_eos=True)
+register_template(
+    name="qwen",
+    prefix=[{"token": "<|im_start|>"}, "system\n{{system}}"],
+    prompt=[
+        {"token": "<|im_start|>"},
+        "user\n{{query}}",
+        {"token": "<|im_end|>"},
+        "\n",
+        {"token": "<|im_start|>"},
+        "assistant\n",
+    ],
+    system="You are a helpful assistant.",
+    sep=[{"token": "<|im_end|>"}, "\n"],
+    stop_words=["<|im_end|>"],
+    efficient_eos=True,
+)
 
 
 class SupervisedFintuningModule(LightningModule):
@@ -43,7 +58,6 @@ class SupervisedFintuningModule(LightningModule):
         super().__init__()
         self.args = args
         # 加载模型
-        self.config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(
             args.model_name_or_path,
             use_fast=not args.use_slow_tokenizer,
@@ -51,12 +65,15 @@ class SupervisedFintuningModule(LightningModule):
         )
 
         self.llm_metrics = LanguageModelMetric()
-        self.template = get_template_and_fix_tokenizer("aquila-chat", self.tokenizer)
+        self.template = get_template_and_fix_tokenizer("qwen", self.tokenizer)
         self.save_hyperparameters()
 
-    def configure_model(self):
+        # def configure_model(self):
+        self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
+            if self.is_deepspeed_zero3_enabled:
+                raise ValueError("DeepSpeed ZeRO-3 is incompatible with quantization.")
             if self.args.quantization_bit == "4bit":
                 # load_in_4bit = (True,)
                 quantization_config = BitsAndBytesConfig(
@@ -80,7 +97,7 @@ class SupervisedFintuningModule(LightningModule):
 
         else:
             # 使用bf16 来加载模型
-            self.print(f"model config===\n{self.config}")
+            print(f"model config===\n{self.config}")
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.model_name_or_path,
                 from_tf=bool(".ckpt" in self.args.model_name_or_path),
@@ -96,7 +113,6 @@ class SupervisedFintuningModule(LightningModule):
         #     model.resize_token_embeddings(len(tokenizer))
 
         # model.supports_gradient_checkpointing = True  #
-
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
 
@@ -155,12 +171,29 @@ class SupervisedFintuningModule(LightningModule):
 
         self.model = model
         self.generation_config = model.generation_config
-        # __import__("pprint").pprint(self.generation_config)
-
         self.model.print_trainable_parameters()
 
+    def print_example(self, example):
+        print("input_ids:\n{}".format(example["input_ids"]))
+        print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
+        print("label_ids:\n{}".format(example["labels"]))
+        print(
+            "labels:\n{}".format(
+                self.tokenizer.decode(
+                    [d if d != IGNORE_INDEX else self.tokenizer.pad_token_id for d in example["labels"]],
+                    skip_special_tokens=False,
+                )
+            )
+        )
+
     def setup(self, stage):
-        raw_datasets = load_dataset("json", data_files={"train": self.args.train_data, "dev": self.args.dev_data})
+        data_files = {}
+        data_files["train"] = [train.strip() for train in self.args.train_data.strip().split(",")]
+        data_files["validation"] = [dev.strip() for dev in self.args.dev_data.strip().split(",")]
+        self.print(f"loading datafiles ={data_files}")
+
+        raw_datasets = load_dataset("json", data_files=data_files)
+
         preprocessing_function_train = functools.partial(
             preprocess_supervised_dataset_train,
             tokenizer=self.tokenizer,
@@ -178,16 +211,17 @@ class SupervisedFintuningModule(LightningModule):
             desc="Running tokenizer on train dataset",
         )
 
+        self.print_example(self.train_dataset[0])
+
         preprocessing_function_test = functools.partial(
             preprocess_supervised_dataset_test,
             tokenizer=self.tokenizer,
             template=self.template,
             max_source_length=self.args.max_source_length,
             max_target_length=self.args.max_target_length,
-            ignore_pad_token_for_loss=True,
         )
 
-        self.dev_dataset = raw_datasets["dev"].map(
+        self.dev_dataset = raw_datasets["validation"].map(
             preprocessing_function_train,
             batched=True,
             num_proc=self.args.preprocessing_num_workers,
@@ -196,13 +230,13 @@ class SupervisedFintuningModule(LightningModule):
             desc="Running tokenizer on validation dataset",
         )
 
-        self.test_dataset = raw_datasets["dev"].map(
+        self.test_dataset = raw_datasets["validation"].map(
             preprocessing_function_test,
             batched=True,
             num_proc=self.args.preprocessing_num_workers,
             remove_columns=column_names,
             load_from_cache_file=not self.args.overwrite_cache,
-            desc="Running tokenizer on validation dataset for testing",
+            desc="Running tokenizer on test dataset for testing",
         )
 
     @property
@@ -251,13 +285,16 @@ class SupervisedFintuningModule(LightningModule):
         )
 
     def test_dataloader(self):
+        tokenizer = self.tokenizer
+        # test 使用left padding
+        tokenizer.padding_side = "left"
         return DataLoader(
             dataset=self.dev_dataset,
             batch_size=self.args.per_device_eval_batch_size,
             num_workers=4,
             pin_memory=True,
             collate_fn=DataCollatorForSeq2Seq(
-                self.tokenizer,
+                tokenizer,
                 label_pad_token_id=IGNORE_INDEX if self.args.ignore_pad_token_for_loss else self.tokenizer.pad_token_id,
                 pad_to_multiple_of=8,
                 return_tensors="pt",
@@ -278,7 +315,7 @@ class SupervisedFintuningModule(LightningModule):
     def test_step(self, batch, batch_idx):
         # deepspeed zero3 cause inflight param when using model.generate
         synced_gpus = True if self.is_deepspeed_zero3_enabled else False
-        preds = self.model.generate(**batch, max_new_tokens=128, synced_gpus=synced_gpus)
+        preds = self.model.generate(**batch, max_new_tokens=1024, synced_gpus=synced_gpus)
         # print(f"preds.shape=={preds.shape}")
         self.llm_metrics.update(preds, batch["labels"])
 

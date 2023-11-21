@@ -14,32 +14,20 @@ from peft import PeftModel
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from tqdm import tqdm
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    GenerationConfig,
-    LogitsProcessorList,
-    MaxLengthCriteria,
-    MinLengthLogitsProcessor,
-    StoppingCriteriaList,
-    TemperatureLogitsWarper,
-    TopKLogitsWarper,
-    TopPLogitsWarper,
-)
+from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                          BitsAndBytesConfig, GenerationConfig,
+                          LogitsProcessorList, MaxLengthCriteria,
+                          MinLengthLogitsProcessor, StoppingCriteriaList,
+                          TemperatureLogitsWarper, TopKLogitsWarper,
+                          TopPLogitsWarper)
 from transformers.activations import ACT2FN
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-    SequenceClassifierOutputWithPast,
-)
+from transformers.modeling_outputs import (BaseModelOutputWithPast,
+                                           CausalLMOutputWithPast,
+                                           SequenceClassifierOutputWithPast)
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    logging,
-    replace_return_docstrings,
-)
+from transformers.utils import (add_start_docstrings,
+                                add_start_docstrings_to_model_forward, logging,
+                                replace_return_docstrings)
 
 
 class SeparatorStyle(IntEnum):
@@ -629,8 +617,8 @@ def main():
     output = []
     num = 0
     with open(args.data_path, "r", encoding="utf-8") as g:
-        data = json.load(g)
-        for example in data:
+        for line in g:
+            example = json.loads(line)
             num += 1
             instruction = example["instruction"]
             inputs = example["input"]
