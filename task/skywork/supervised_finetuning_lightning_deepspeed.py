@@ -34,6 +34,15 @@ from llm.src.datasets.template import get_template_and_fix_tokenizer, register_t
 from llm.src.utils import find_all_linear_names
 from metrics.language_model import LanguageModelMetric
 
+register_template(
+    name="skywork-chat-llama2",
+    prefix=["<<SYS>>\n{{system}}\n<</SYS>>\n\n"],
+    prompt=["[INST] {{query}} [/INST]"],
+    system="You are a helpful assistant. 你是一个乐于助人的助手。",
+    sep=[],
+)
+# PROMPT_TEMPLATE = "[INST] <<SYS>>\n" "You are a helpful assistant. 你是一个乐于助人的助手。\n" "<</SYS>>\n\n{instruction} [/INST]"
+
 
 class SupervisedFintuningModule(LightningModule):
     def __init__(self, args):
@@ -47,7 +56,7 @@ class SupervisedFintuningModule(LightningModule):
         )
 
         self.llm_metrics = LanguageModelMetric()
-        self.template = get_template_and_fix_tokenizer("default", self.tokenizer)
+        self.template = get_template_and_fix_tokenizer("skywork-chat-llama2", self.tokenizer)
         self.save_hyperparameters()
 
     def configure_model(self):

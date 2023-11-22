@@ -8,22 +8,25 @@ MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 
 export MODEL_PATH=/data/SHARE/MODELS/SkyWork/Skywork-13B-base/
 
-deepspeed --include=localhost:2,3 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/internlm/supervised_finetuning_lightning_deepspeed.py \
+export TRAIN_DATA=/home/zb/suningGit/zb/train_data/v4_plus/sn_generate_gpt_v4_plus_with_alpaca_train.json
+export DEV_DATA=/home/zb/suningGit/zb/train_data/v1/sn_generate_gpt_v1_dev.json
+
+deepspeed --include=localhost:0,1 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/skywork/supervised_finetuning_lightning_deepspeed.py \
 	--deepspeed ${DS_CONFIG_STAGE_2} \
 	--overwrite_cache \
 	--model_name_or_path ${MODEL_PATH} \
-	--output_dir /home/zb/saved_checkpoint/internlm_20b_split_task \
-	--train_data /home/zb/train_data/baichuan_sft/single_task_sn_v2/split_task_v2/test.json \
-	--dev_data /home/zb/train_data/baichuan_sft/single_task_sn_v2/split_task_v2/test.json \
+	--output_dir /home/zb/saved_checkpoint/skywork_v4_plus_2epoch_lr1e4 \
+	--train_data ${TRAIN_DATA} \
+	--dev_data ${DEV_DATA} \
 	--max_epochs 2 \
 	--max_source_length 1024 \
-	--max_target_length 1024 \
+	--max_target_length 2048 \
 	--warmup_proportion 0.1 \
 	--per_device_train_batch_size 8 \
 	--per_device_eval_batch_size 8 \
 	--learning_rate 2e-5 \
 	--save_steps 500 \
 	--use_lora true \
-	--lora_target q_proj,v_proj \
+	--lora_target all \
 	--lr_scheduler_type cosine \
 	--low_cpu_mem_usage

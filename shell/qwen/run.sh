@@ -7,14 +7,15 @@ export DS_CONFIG_STAGE_2=/home/zb/NlpTaskSpace-llm/config/lightning_deepspeed/ze
 
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 export TOKENIZERS_PARALLELISM=false
-export MODEL_PATH=/home/zb/model/Qwen-14B/
+export HF_ENDPOINT=https://hf-mirror.com
+export MODEL_PATH=Qwen/Qwen-14B
 
 # v4_plus 版本训练
 export TRAIN_DATA="/home/zb/suningGit/zb/train_data/v4_plus/sn_generate_gpt_v4_plus_train.json"
 export DEV_DATA="/home/zb/suningGit/zb/train_data/v1/sn_generate_gpt_v1_dev.json"
 
-deepspeed --include=localhost:6,7 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/qwen/supervised_finetuning_lightning_deepspeed.py \
-	--deepspeed ${DS_CONFIG_STAGE_2} \
+# deepspeed error RuntimeError: torch.cat(): expected a non-empty list of Tensors
+CUDA_VISIBLE_DEVICES=2,3 python task/qwen/supervised_finetuning_lightning_deepspeed.py \
 	--overwrite_cache \
 	--model_name_or_path ${MODEL_PATH} \
 	--output_dir /home/zb/saved_checkpoint/qwen_chat_sn_v4_plus_alpaca_2epoch_1e4 \
