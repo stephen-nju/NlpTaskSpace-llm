@@ -9,7 +9,7 @@ from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning import LightningModule, Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.strategies import DeepSpeedStrategy
+from lightning.pytorch.strategies import DeepSpeedStrategy, FSDPStrategy
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from rouge_chinese import Rouge
@@ -29,7 +29,11 @@ from transformers import (
 
 from llm.src.callbacks import HFModelCheckpoint
 from llm.src.constant import IGNORE_INDEX
-from llm.src.datasets.preprocessing import preprocess_supervised_dataset_test, preprocess_supervised_dataset_train
+from llm.src.datasets.preprocessing import (
+    preprocess_packed_supervised_dataset_train,
+    preprocess_supervised_dataset_test,
+    preprocess_supervised_dataset_train,
+)
 from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
 from llm.src.utils import find_all_linear_names
 from metrics.language_model import LanguageModelMetric
@@ -56,10 +60,10 @@ class SupervisedFintuningModule(LightningModule):
         )
 
         self.llm_metrics = LanguageModelMetric()
-        self.template = get_template_and_fix_tokenizer("skywork-chat-llama2", self.tokenizer)
+        self.template = get_template_and_fix_tokenizer("qwen", self.tokenizer)
         self.save_hyperparameters()
 
-    def configure_model(self):
+        # def configure_model(self):
         self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
@@ -184,9 +188,10 @@ class SupervisedFintuningModule(LightningModule):
         self.print(f"loading datafiles ={data_files}")
 
         raw_datasets = load_dataset("json", data_files=data_files)
-
         preprocessing_function_train = functools.partial(
-            preprocess_supervised_dataset_train,
+            preprocess_packed_supervised_dataset_train
+            if self.args.sft_packing
+            else preprocess_supervised_dataset_train,
             tokenizer=self.tokenizer,
             template=self.template,
             max_source_length=self.args.max_source_length,
@@ -577,25 +582,34 @@ if __name__ == "__main__":
         default=32,
         help="The scale factor for LoRA fine-tuning (similar with the learning rate)",
     )
-
     parser.add_argument("--lora_dropout", type=float, default=0.1, help="")
     parser.add_argument(
         "--lora_target",
         type=str,
         default=None,
-        help='Baichuan choices: ["W_pack", "o_proj", "gate_proj", "up_proj", "down_proj"]',
+        help="lora target name",
     )
     parser.add_argument("--lora_ckpt_path", type=str, default=None, help="")
+    parser.add_argument("--max_steps", type=int, default=-1, help="max train steps")
+    parser.add_argument("--fsdp", action="store_true", help="using fsdp strategy for training")
+    parser.add_argument(
+        "--sft_packing", action="store_true", help="packing multi round qa in supervised  fintuning stage"
+    )
     arg = parser.parse_args()
+    # 检查会冲突的参数
+    if arg.deepspeed and arg.fsdp:
+        # 训练策略智能选一个
+        raise ValueError("Either --deepspeed or --fsdp has to be provided")
 
     if arg.seed is not None:
         seed_everything(arg.seed)
-
     # 先加载模型，再加载数据
     model = SupervisedFintuningModule(arg)
 
     if arg.deepspeed:
         strategy = DeepSpeedStrategy(config=arg.deepspeed)
+    elif arg.fsdp:
+        strategy = FSDPStrategy()
     else:
         strategy = "auto"
 
@@ -615,6 +629,7 @@ if __name__ == "__main__":
         devices="auto",
         max_epochs=arg.max_epochs,
         strategy=strategy,
+        max_steps=arg.max_steps,
         callbacks=callbacks,
         log_every_n_steps=1,
         num_sanity_val_steps=0,

@@ -11,7 +11,7 @@ export MODEL_PATH=/data/SHARE/MODELS/SkyWork/Skywork-13B-base/
 export TRAIN_DATA=/home/zb/suningGit/zb/train_data/v4_plus/sn_generate_gpt_v4_plus_with_alpaca_train.json
 export DEV_DATA=/home/zb/suningGit/zb/train_data/v1/sn_generate_gpt_v1_dev.json
 
-deepspeed --include=localhost:0,1 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/skywork/supervised_finetuning_lightning_deepspeed.py \
+deepspeed --include=localhost:0,1 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/skywork/supervised_finetuning_lightning.py \
 	--deepspeed ${DS_CONFIG_STAGE_2} \
 	--overwrite_cache \
 	--model_name_or_path ${MODEL_PATH} \

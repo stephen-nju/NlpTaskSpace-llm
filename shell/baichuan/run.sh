@@ -532,7 +532,7 @@ MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 # deepspeed 3 目前不兼容 configure_model,需要初始化加载，deepspeed 3 百川模型验证失败
 source /root/venv/lightning/bin/activate
 # 激活虚拟环境
-deepspeed --include=localhost:6,7 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/baichuan/supervised_finetuning_lightning_deepspeed.py \
+deepspeed --include=localhost:6,7 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/baichuan/supervised_finetuning_lightning.py \
 	--deepspeed ${LIGHTNING_DS_CONFIG_STAGE_2} \
 	--overwrite_cache \
 	--model_name_or_path /home/zb/model/Baichuan2-13B-Base/ \

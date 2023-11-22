@@ -89,3 +89,49 @@ def preprocess_supervised_dataset_test(
     # inputs_ids 进行left padding ,用于生成
 
     return model_inputs
+
+
+def preprocess_packed_supervised_dataset_train(examples, tokenizer, template, max_source_length, max_target_length):
+    # 将数据打包
+    # build inputs with format `<bos> X1 Y1 <eos> <bos> X2 Y2 <eos>`
+    # and labels with format `<ignore> ... <ignore> Y1 <eos> <ignore> ... <ignore> Y2 <eos>`
+    model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
+    input_ids, labels = [], []
+
+    for query, response, history, system in construct_sft_example(examples):
+        if not (isinstance(query, str) and isinstance(response, str) and query != "" and response != ""):
+            # 跳过为空的情况
+            continue
+        for turn_idx, (source_ids, target_ids) in enumerate(
+            template.encode_multiturn(tokenizer, query, response, history, system)
+        ):
+            if turn_idx != 0 and template.efficient_eos:
+                # 第一轮对话不需要加上 efficient_eos
+                # prompt 不需要计算损失
+                source_mask = [tokenizer.eos_token_id] + [IGNORE_INDEX] * (len(source_ids) - 1)
+            else:
+                source_mask = [IGNORE_INDEX] * len(source_ids)
+            input_ids += source_ids + target_ids
+            labels += source_mask + target_ids
+
+    if template.efficient_eos:
+        input_ids += [tokenizer.eos_token_id]
+        labels += [tokenizer.eos_token_id]
+
+    total_length = len(input_ids)
+    # 不单独计算source 和 target 的长度，因为包含多个source 和target
+    block_size = max_source_length + max_target_length
+
+    if len(total_length) > block_size:
+        total_length = (total_length // block_size) * block_size
+        for i in range(0, total_length, block_size):
+            model_inputs["input_ids"].append(input_ids[i : i + block_size])
+            model_inputs["attention_mask"].append([1] * block_size)
+            model_inputs["labels"].append(labels[i : i + block_size])
+    else:
+        # 长度不足的时候可以padding
+        model_inputs["input_ids"].append(input_ids)
+        model_inputs["attention_mask"].append([1] * len(input_ids))
+        model_inputs["labels"].append(labels)
+
+    return model_inputs

@@ -31,6 +31,7 @@ from transformers import (
 from llm.src.callbacks import HFModelCheckpoint
 from llm.src.constant import IGNORE_INDEX
 from llm.src.datasets.preprocessing import (
+    preprocess_packed_supervised_dataset_train,
     preprocess_supervised_dataset_test,
     preprocess_supervised_dataset_train,
 )
@@ -196,9 +197,10 @@ class SupervisedFintuningModule(LightningModule):
         self.print(f"loading datafiles ={data_files}")
 
         raw_datasets = load_dataset("json", data_files=data_files)
-
         preprocessing_function_train = functools.partial(
-            preprocess_supervised_dataset_train,
+            preprocess_packed_supervised_dataset_train
+            if self.args.sft_packing
+            else preprocess_supervised_dataset_train,
             tokenizer=self.tokenizer,
             template=self.template,
             max_source_length=self.args.max_source_length,
@@ -599,7 +601,9 @@ if __name__ == "__main__":
     parser.add_argument("--lora_ckpt_path", type=str, default=None, help="")
     parser.add_argument("--max_steps", type=int, default=-1, help="max train steps")
     parser.add_argument("--fsdp", action="store_true", help="using fsdp strategy for training")
-
+    parser.add_argument(
+        "--sft_packing", action="store_true", help="packing multi round qa in supervised  fintuning stage"
+    )
     arg = parser.parse_args()
     # 检查会冲突的参数
     if arg.deepspeed and arg.fsdp:
