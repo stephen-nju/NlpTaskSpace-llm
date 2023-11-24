@@ -1,20 +1,19 @@
 # ----*----coding:utf8-----*---
 
 import argparse
-import functools
 import glob
+import math
 import os
 from itertools import chain
 from types import MethodType
 from typing import Any, Dict, Tuple, Union
 
-import datasets
 import torch
 from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning import LightningModule, Trainer, seed_everything
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.strategies import DeepSpeedStrategy, FSDPStrategy
-from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
@@ -22,7 +21,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    DataCollatorForSeq2Seq,
+    default_data_collator,
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup,
@@ -31,7 +30,7 @@ from transformers import (
 from llm.src.callbacks import HFModelCheckpoint
 from llm.src.constant import IGNORE_INDEX
 from llm.src.utils import find_all_linear_names
-from metrics.language_model import LanguageModelMetric
+from metrics.language_model import AccMetric
 
 
 class SupervisedFintuningModule(LightningModule):
@@ -44,10 +43,10 @@ class SupervisedFintuningModule(LightningModule):
             use_fast=not args.use_slow_tokenizer,
             trust_remote_code=True,
         )
-        self.llm_metrics = LanguageModelMetric()
+        self.acc_metrics = AccMetric()
         self.save_hyperparameters()
 
-        # def configure_model(self):
+    def configure_model(self):
         self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
@@ -76,7 +75,7 @@ class SupervisedFintuningModule(LightningModule):
 
         else:
             # 使用bf16 来加载模型
-            print(f"model config===\n{self.config}")
+            self.trainer.print(f"model config===\n{self.config}")
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.model_name_or_path,
                 from_tf=bool(".ckpt" in self.args.model_name_or_path),
@@ -168,10 +167,10 @@ class SupervisedFintuningModule(LightningModule):
         return result
 
     def print_example(self, example):
-        print("input_ids:\n{}".format(example["input_ids"]))
-        print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
-        print("label_ids:\n{}".format(example["labels"]))
-        print(
+        self.trainer.print("input_ids:\n{}".format(example["input_ids"]))
+        self.trainer.print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
+        self.trainer.print("label_ids:\n{}".format(example["labels"]))
+        self.trainer.print(
             "labels:\n{}".format(
                 self.tokenizer.decode(
                     [d if d != IGNORE_INDEX else self.tokenizer.pad_token_id for d in example["labels"]],
@@ -187,7 +186,7 @@ class SupervisedFintuningModule(LightningModule):
         if self.args.block_size is None:
             block_size = self.tokenizer.model_max_length
             if block_size > 2048:
-                self.logger.warning(
+                self.trainer.print(
                     "The chosen tokenizer supports a `model_max_length` that is longer than the default `block_size` value"
                     " of 2048. If you would like to use a longer `block_size` up to `tokenizer.model_max_length` you can"
                     " override this default with `--block_size xxx`."
@@ -195,7 +194,7 @@ class SupervisedFintuningModule(LightningModule):
 
         else:
             if self.args.block_size > self.tokenizer.model_max_length:
-                self.logger.warning(
+                self.trainer.print(
                     f"The block_size passed ({self.args.block_size}) is larger than the maximum length for the model"
                     f"({self.tokenizer.model_max_length}). Using block_size={self.tokenizer.model_max_length}."
                 )
@@ -236,7 +235,7 @@ class SupervisedFintuningModule(LightningModule):
             data_files = {}
             dataset_args = {}
             if self.args.train_data is not None:
-                train_dof = [s.strip() for s in self.args.train_data.split(",")]
+                train_dof = [s.strip() for s in self.args.train_data.strip().split(",")]
             else:
                 raise ValueError("train data should not be none")
             # direcotory_or_file
@@ -279,14 +278,14 @@ class SupervisedFintuningModule(LightningModule):
                         dev_files.extend(files)
                     else:
                         raise ValueError("train data should be valid file path or direcotory path split by ','")
-                self.logger.info(f"eval files: {dev_files}")
+                self.trainer.print(f"eval files: {dev_files}")
                 data_files["validation"] = dev_files
 
-            self.print(f"loading data files={data_files}")
+            self.trainer.print(f"loading data files={data_files}")
 
             extension = "text" if data_files["train"][0].endswith("txt") else "json"
             if extension == "text":
-                dataset_args["keep_linebreaks"] = self.args.keep_linebreaks
+                dataset_args["keep_linebreaks"] = not self.args.no_keep_linebreaks
 
             raw_datasets = load_dataset(
                 extension,
@@ -338,27 +337,23 @@ class SupervisedFintuningModule(LightningModule):
                 batched=True,
             )
 
-        train_dataset = None
         max_train_samples = 0
-        train_dataset = lm_datasets["train"]
-        max_train_samples = len(train_dataset)
+        self.train_dataset = lm_datasets["train"]
+        max_train_samples = len(self.train_dataset)
         if self.args.max_train_samples is not None and self.args.max_train_samples > 0:
-            max_train_samples = min(len(train_dataset), self.args.max_train_samples)
-            self.train_dataset = train_dataset.select(range(max_train_samples))
+            max_train_samples = min(len(self.train_dataset), self.args.max_train_samples)
+            self.train_dataset = self.train_dataset.select(range(max_train_samples))
 
-        self.logger.debug(f"Num train_samples: {len(train_dataset)}")
-        self.logger.debug("Tokenized training example:")
-        self.logger.debug(self.tokenizer.decode(train_dataset[0]["input_ids"]))
+        self.trainer.print(f"Num train_samples: {len(self.train_dataset)}")
+        self.trainer.print("Tokenized training example:")
+        self.trainer.print(self.tokenizer.decode(self.train_dataset[0]["input_ids"]))
 
-        eval_dataset = None
         max_eval_samples = 0
-        eval_dataset = lm_datasets["validation"]
-        max_eval_samples = len(eval_dataset)
+        self.dev_dataset = lm_datasets["validation"]
+        max_eval_samples = len(self.dev_dataset)
         if self.args.max_eval_samples is not None and self.args.max_eval_samples > 0:
-            max_eval_samples = min(len(eval_dataset), self.args.max_eval_samples)
-            self.dev_dataset = eval_dataset.select(range(max_eval_samples))
-
-        self.print_example(self.train_dataset[0])
+            max_eval_samples = min(len(self.dev_dataset), self.args.max_eval_samples)
+            self.dev_dataset = self.dev_dataset.select(range(max_eval_samples))
 
     @property
     def deepspeed_offload(self) -> bool:
@@ -381,6 +376,7 @@ class SupervisedFintuningModule(LightningModule):
             batch_size=self.args.per_device_train_batch_size,
             num_workers=4,
             pin_memory=True,
+            collate_fn=default_data_collator,
         )
 
     def val_dataloader(self):
@@ -389,6 +385,7 @@ class SupervisedFintuningModule(LightningModule):
             batch_size=self.args.per_device_eval_batch_size,
             num_workers=4,
             pin_memory=True,
+            collate_fn=default_data_collator,
         )
 
     def training_step(self, batch, batch_idx):
@@ -399,7 +396,27 @@ class SupervisedFintuningModule(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         output = self.model(**batch)
-        self.log("eval_loss", output.loss, prog_bar=True, sync_dist=True)
+        preds = self.preprocess_logits_for_metrics(output.logits)
+        labels = batch["labels"]
+        labels = labels[:, 1:].reshape(-1)
+        preds = preds[:, :-1].reshape(-1)
+        self.acc_metrics.update(preds, labels)
+        try:
+            perplexity = math.exp(output.loss)
+        except OverflowError:
+            perplexity = float("inf")
+        self.log("ppl", perplexity, prog_bar=True, sync_dist=True)
+
+    def on_validation_epoch_end(self):
+        acc = self.acc_metrics.compute(global_rank=self.global_rank)
+        self.log("acc", acc, prog_bar=True, sync_dist=True)
+
+    def preprocess_logits_for_metrics(self, logits):
+        if isinstance(logits, tuple):
+            # Depending on the model and config, logits may contain extra tensors,
+            # like past_key_values, but logits always come first
+            logits = logits[0]
+        return logits.argmax(dim=-1)
 
     def configure_optimizers(self):
         no_decay = ["bias", "LayerNorm.weight"]
@@ -471,9 +488,9 @@ if __name__ == "__main__":
         default="./output_dir/",
         help="path to save model and checkpoint .it is the root dir",
     )
-    parser.add_argument("--train_data", type=str, default="", help="the input train file or train data directory")
-    parser.add_argument("--test_data", type=str, default="", help="test data path")
-    parser.add_argument("--dev_data", type=str, default="", help="dev data path")
+    parser.add_argument("--train_data", type=str, default=None, help="the input train file or train data directory")
+    parser.add_argument("--test_data", type=str, default=None, help="test data path")
+    parser.add_argument("--dev_data", type=str, default=None, help="dev data path")
     parser.add_argument(
         "--dataset_name", type=str, default=None, help="The name of the dataset to use (via the datasets library)."
     )
@@ -510,10 +527,17 @@ if __name__ == "__main__":
         default=None,
     )
     parser.add_argument(
+        "--checkpointing_steps",
+        type=str,
+        default=None,
+        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
+    )
+    parser.add_argument(
         "--save_steps",
         type=int,
         default=500,
     )
+    parser.add_argument("--save_total_limit", type=int, default=None, help="save total limit")
 
     parser.add_argument(
         "--lr_scheduler_type",
@@ -619,12 +643,6 @@ if __name__ == "__main__":
         help="Do not keep line breaks when using TXT files.",
     )
     parser.add_argument(
-        "--checkpointing_steps",
-        type=str,
-        default=None,
-        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
-    )
-    parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
         default=None,
@@ -674,7 +692,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lora_alpha",
         type=float,
-        default=32,
+        default=None,
         help="The scale factor for LoRA fine-tuning (similar with the learning rate)",
     )
     parser.add_argument("--lora_dropout", type=float, default=0.1, help="")
@@ -710,15 +728,49 @@ if __name__ == "__main__":
 
     # 添加常用的checkpoint
     callbacks = []
-    checkpoint = HFModelCheckpoint(
-        monitor="train_loss",
+
+    last_checkpoint = HFModelCheckpoint(
         dirpath=arg.output_dir,
-        every_n_train_steps=arg.save_steps,
         filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
         save_last=True,
+        save_top_k=1,
+        save_on_train_epoch_end=True,
+        every_n_epochs=1,
         save_hf=True,
     )
-    callbacks.append(checkpoint)
+
+    callbacks.append(last_checkpoint)
+
+    if arg.checkpointing_steps == "epoch":
+        checkpoint = HFModelCheckpoint(
+            dirpath=arg.output_dir,
+            filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
+            save_last=True,
+            save_top_k=-1,
+            every_n_epochs=1,
+        )
+        callbacks.append(checkpoint)
+    else:
+        if arg.save_steps is not None and arg.save_total_limit is None:
+            every_n_train_steps = arg.save_steps
+            save_top_k = 1
+        elif arg.save_steps is not None and arg.save_total_limit is not None:
+            every_n_train_steps = arg.save_steps
+            save_top_k = arg.save_total_limit
+        else:
+            every_n_train_steps = None
+            save_top_k = None
+
+        checkpoint = HFModelCheckpoint(
+            monitor="global_step",
+            mode="max",
+            dirpath=arg.output_dir,
+            filename="sn-generate-{global_step:02d}-{train_loss:.2f}",
+            every_n_train_steps=every_n_train_steps,
+            save_top_k=save_top_k,
+            save_on_train_epoch_end=True,
+        )
+        callbacks.append(checkpoint)
 
     trainer = Trainer(
         devices="auto",
@@ -731,6 +783,5 @@ if __name__ == "__main__":
         default_root_dir=arg.output_dir,
         accumulate_grad_batches=arg.gradient_accumulation_steps,
     )
-    trainer.fit(model)
 
-    trainer.test(model)
+    trainer.fit(model)
