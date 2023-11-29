@@ -2,6 +2,7 @@ import jieba
 import numpy as np
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from rouge_chinese import Rouge
+from sklearn.metrics import accuracy_score
 from torchmetrics import Metric
 
 
@@ -18,7 +19,7 @@ class LanguageModelMetric(Metric):
 
     def compute(self, tokenizer, ignore_pad_token_for_loss, global_rank):
         # print(f"leN({self.preds})===self.preds shape={self.preds[0].shape}==self.preds={self.preds[0]}")
-        
+
         for preds, labels in zip(self.preds, self.labels):
             preds = preds.detach().cpu()
             labels = labels.detach().cpu()
@@ -44,3 +45,28 @@ class LanguageModelMetric(Metric):
             for k, v in score_dict.items():
                 score_dict[k] = float(np.mean(v))
             return score_dict
+
+
+class AccMetric(Metric):
+    def __init__(self):
+        super().__init__()
+        self.add_state("preds", [])
+        self.add_state("labels", [])
+
+    def update(self, pred, label):
+        # print(f"pred shape={pred.shape},target shape={label.shape}")
+        self.preds.append(pred)
+        self.labels.append(label)
+
+    def compute(self, global_rank, normalize=True, sample_weight=None):
+        p, l = [], []
+        for preds, labels in zip(self.preds, self.labels):
+            preds = preds.detach().cpu()
+            labels = labels.detach().cpu()
+            p.extend(preds)
+            l.extend(labels)
+        acc = float(accuracy_score(l, p, normalize=normalize, sample_weight=sample_weight))
+        if global_rank == 0:
+            print(acc)
+
+        return acc

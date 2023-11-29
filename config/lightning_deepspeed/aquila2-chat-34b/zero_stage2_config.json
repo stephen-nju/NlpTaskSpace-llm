@@ -1,6 +1,9 @@
 {
     "steps_per_print": 64,
     "gradient_clipping": 1.0,
+    "bf16": {
+        "enabled": "auto"
+    },
     "zero_optimization": {
         "stage": 2,
         "allgather_partitions": true,

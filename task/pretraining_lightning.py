@@ -2,12 +2,15 @@
 
 import argparse
 import glob
+import logging
 import math
 import os
 from itertools import chain
 from types import MethodType
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, List, Mapping, Tuple, Union
 
+import numpy as np
+import tiktoken
 import torch
 from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -44,6 +47,26 @@ class SupervisedFintuningModule(LightningModule):
             trust_remote_code=True,
         )
         self.acc_metrics = AccMetric()
+        if self.tokenizer.eos_token_id is None:
+            self.tokenizer.eos_token = "<|endoftext|>"
+            logging.info("Add eos token: {}".format(self.tokenizer.eos_token))
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            logging.info("Add pad token: {}".format(self.tokenizer.pad_token))
+
+        # tokenizer.add_special_tokens(
+        #     dict(additional_special_tokens=template.stop_words), replace_additional_special_tokens=False
+        # )
+
+        if isinstance(getattr(self.tokenizer, "tokenizer", None), tiktoken.Encoding):  # for tiktoken tokenizer (Qwen)
+            self.tokenized_kwargs = dict(allowed_special="all")
+        else:
+            self.tokenized_kwargs = dict(add_special_tokens=True)
+
+        if hasattr(self.tokenizer, "add_eos_token"):  # for LLaMA tokenizer
+            self.add_eos_token_flag = getattr(self.tokenizer, "add_eos_token")
+            setattr(self.tokenizer, "add_eos_token", True)
+
         self.save_hyperparameters()
 
     def configure_model(self):
@@ -166,6 +189,9 @@ class SupervisedFintuningModule(LightningModule):
         result["labels"] = result["input_ids"].copy()
         return result
 
+    def tokenize_function(self, examples):
+        return self.tokenizer(examples["text"], **self.tokenized_kwargs)
+
     def print_example(self, example):
         self.trainer.print("input_ids:\n{}".format(example["input_ids"]))
         self.trainer.print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
@@ -179,8 +205,46 @@ class SupervisedFintuningModule(LightningModule):
             )
         )
 
-    def tokenize_function(self, examples):
-        return self.tokenizer(examples["text"])
+    @staticmethod
+    def fault_tolerance_data_collator(features: List) -> Dict[str, Any]:
+        if not isinstance(features[0], Mapping):
+            features = [vars(f) for f in features]
+        first = features[0]
+        batch = {}
+        # Special handling for labels.
+        # Ensure that tensor is created with the correct type
+        if "label" in first and first["label"] is not None:
+            label = first["label"].item() if isinstance(first["label"], torch.Tensor) else first["label"]
+            dtype = torch.long if isinstance(label, int) else torch.float
+            batch["labels"] = torch.tensor([f["label"] for f in features], dtype=dtype)
+        elif "label_ids" in first and first["label_ids"] is not None:
+            if isinstance(first["label_ids"], torch.Tensor):
+                batch["labels"] = torch.stack([f["label_ids"] for f in features])
+            else:
+                dtype = torch.long if type(first["label_ids"][0]) is int else torch.float
+                batch["labels"] = torch.tensor([f["label_ids"] for f in features], dtype=dtype)
+        # Handling of all other possible keys.
+        # Again, we will use the first element to figure out which key/values are not None for this model.
+        try:
+            for k, v in first.items():
+                if k not in ("label", "label_ids") and v is not None and not isinstance(v, str):
+                    if isinstance(v, torch.Tensor):
+                        batch[k] = torch.stack([f[k] for f in features])
+                    elif isinstance(v, np.ndarray):
+                        batch[k] = torch.tensor(np.stack([f[k] for f in features]))
+                    else:
+                        batch[k] = torch.tensor([f[k] for f in features])
+        except ValueError:  # quick fix by simply take the first example
+            for k, v in first.items():
+                if k not in ("label", "label_ids") and v is not None and not isinstance(v, str):
+                    if isinstance(v, torch.Tensor):
+                        batch[k] = torch.stack([features[0][k]] * len(features))
+                    elif isinstance(v, np.ndarray):
+                        batch[k] = torch.tensor(np.stack([features[0][k]] * len(features)))
+                    else:
+                        batch[k] = torch.tensor([features[0][k]] * len(features))
+
+        return batch
 
     def setup(self, stage):
         if self.args.block_size is None:
@@ -199,7 +263,8 @@ class SupervisedFintuningModule(LightningModule):
                     f"({self.tokenizer.model_max_length}). Using block_size={self.tokenizer.model_max_length}."
                 )
 
-            block_size = min(self.args.block_size, self.tokenizer.model_max_length)
+            # setting block size
+            self.args.block_size = min(self.args.block_size, self.tokenizer.model_max_length)
 
         # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
         # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
@@ -245,9 +310,9 @@ class SupervisedFintuningModule(LightningModule):
                     train_files.append(dof)
                 elif os.path.exists(dof) and os.path.isdir(dof):
                     files = (
-                        glob(f"{dof}/**/*.txt", recursive=True)
-                        + glob(f"{dof}/**/*.json", recursive=True)
-                        + glob(f"{dof}/**/*.jsonl", recursive=True)
+                        glob.glob(f"{dof}/**/*.txt", recursive=True)
+                        + glob.glob(f"{dof}/**/*.json", recursive=True)
+                        + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
                     )
                     types = [f.split(".")[-1] for f in files]
                     if len(set(types)) > 1:
@@ -265,9 +330,9 @@ class SupervisedFintuningModule(LightningModule):
                         dev_files.append(dof)
                     elif os.path.exists(dof) and os.path.isdir(dof):
                         files = (
-                            glob(f"{dof}/**/*.txt", recursive=True)
-                            + glob(f"{dof}/**/*.json", recursive=True)
-                            + glob(f"{dof}/**/*.jsonl", recursive=True)
+                            glob.glob(f"{dof}/**/*.txt", recursive=True)
+                            + glob.glob(f"{dof}/**/*.json", recursive=True)
+                            + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
                         )
 
                         types = [f.split(".")[-1] for f in files]
@@ -323,7 +388,7 @@ class SupervisedFintuningModule(LightningModule):
                 batched=True,
                 num_proc=self.args.preprocessing_num_workers,
                 load_from_cache_file=not self.args.overwrite_cache,
-                desc=f"Grouping texts in chunks of {block_size}",
+                desc=f"Grouping texts in chunks of {self.args.block_size}",
             )
         else:
             tokenized_datasets = raw_datasets.map(
@@ -346,7 +411,9 @@ class SupervisedFintuningModule(LightningModule):
 
         self.trainer.print(f"Num train_samples: {len(self.train_dataset)}")
         self.trainer.print("Tokenized training example:")
-        self.trainer.print(self.tokenizer.decode(self.train_dataset[0]["input_ids"]))
+        self.print_example(self.train_dataset[0])
+
+        # self.trainer.print(self.tokenizer.decode(self.train_dataset[0]["input_ids"]))
 
         max_eval_samples = 0
         self.dev_dataset = lm_datasets["validation"]
@@ -376,7 +443,7 @@ class SupervisedFintuningModule(LightningModule):
             batch_size=self.args.per_device_train_batch_size,
             num_workers=4,
             pin_memory=True,
-            collate_fn=default_data_collator,
+            collate_fn=self.fault_tolerance_data_collator,
         )
 
     def val_dataloader(self):
@@ -385,7 +452,7 @@ class SupervisedFintuningModule(LightningModule):
             batch_size=self.args.per_device_eval_batch_size,
             num_workers=4,
             pin_memory=True,
-            collate_fn=default_data_collator,
+            collate_fn=self.fault_tolerance_data_collator,
         )
 
     def training_step(self, batch, batch_idx):
@@ -397,6 +464,8 @@ class SupervisedFintuningModule(LightningModule):
     def validation_step(self, batch, batch_idx):
         output = self.model(**batch)
         preds = self.preprocess_logits_for_metrics(output.logits)
+        self.log("eval_step_loss", output.loss, on_step=True, prog_bar=True, sync_dist=True)
+
         labels = batch["labels"]
         labels = labels[:, 1:].reshape(-1)
         preds = preds[:, :-1].reshape(-1)
@@ -405,7 +474,9 @@ class SupervisedFintuningModule(LightningModule):
             perplexity = math.exp(output.loss)
         except OverflowError:
             perplexity = float("inf")
-        self.log("ppl", perplexity, prog_bar=True, sync_dist=True)
+
+        self.log("eval_loss", output.loss, on_epoch=True, sync_dist=True)
+        self.log("ppl", perplexity, on_epoch=True, sync_dist=True)
 
     def on_validation_epoch_end(self):
         acc = self.acc_metrics.compute(global_rank=self.global_rank)
@@ -476,6 +547,8 @@ class SupervisedFintuningModule(LightningModule):
 
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         if self.global_rank == 0:
+            if hasattr(self.tokenizer, "add_eos_token"):  # for LLaMA tokenizer
+                setattr(self.tokenizer, "add_eos_token", self.add_eos_token_flag)
             save_path = os.path.join(self.args.output_dir, "hf_tokenizer")
             self.tokenizer.save_pretrained(save_path)
 
@@ -753,7 +826,7 @@ if __name__ == "__main__":
     else:
         if arg.save_steps is not None and arg.save_total_limit is None:
             every_n_train_steps = arg.save_steps
-            save_top_k = 1
+            save_top_k = -1
         elif arg.save_steps is not None and arg.save_total_limit is not None:
             every_n_train_steps = arg.save_steps
             save_top_k = arg.save_total_limit
@@ -762,13 +835,14 @@ if __name__ == "__main__":
             save_top_k = None
 
         checkpoint = HFModelCheckpoint(
-            monitor="global_step",
+            monitor="step",
             mode="max",
             dirpath=arg.output_dir,
-            filename="sn-generate-{global_step:02d}-{train_loss:.2f}",
+            filename="sn-generate-{step:02d}-{train_loss:.2f}",
             every_n_train_steps=every_n_train_steps,
             save_top_k=save_top_k,
             save_on_train_epoch_end=True,
+            save_hf=True,
         )
         callbacks.append(checkpoint)
 

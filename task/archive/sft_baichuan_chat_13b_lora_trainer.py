@@ -1,23 +1,18 @@
 import os
-import transformers
-from transformers import Trainer, TrainingArguments, HfArgumentParser, set_seed
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-)
-import torch
-from dataclasses import field, fields, dataclass
-import bitsandbytes as bnb
+from dataclasses import dataclass, field, fields
 
-from model import load_model
+import bitsandbytes as bnb
+import torch
+import transformers
 from dataset import belle_open_source_500k
+from model import load_model
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import HfArgumentParser, Trainer, TrainingArguments, set_seed
 
 
 @dataclass
 class FinetuneArguments:
-    model_name: str = field()
-    model_path: str = field()
+    model_name: str = field() model_path: str = field()
     data_name: str = field()
     data_path: str = field()
     train_size: int = field(default=-1)

@@ -10,10 +10,10 @@ part of this code is adapted from https://github.com/huggingface/transformers/bl
 
 """
 
+import glob
 import math
 import os
 from dataclasses import dataclass, field
-from glob import glob
 from itertools import chain
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -21,15 +21,24 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from loguru import logger
-from peft import (LoraConfig, PeftModel, TaskType, get_peft_model,
-                  prepare_model_for_kbit_training)
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model, prepare_model_for_kbit_training
 from sklearn.metrics import accuracy_score
-from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
-                          AutoTokenizer, BitsAndBytesConfig, BloomForCausalLM,
-                          BloomTokenizerFast, HfArgumentParser,
-                          LlamaForCausalLM, LlamaTokenizer,
-                          Seq2SeqTrainingArguments, Trainer,
-                          is_torch_tpu_available, set_seed)
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    BloomForCausalLM,
+    BloomTokenizerFast,
+    HfArgumentParser,
+    LlamaForCausalLM,
+    LlamaTokenizer,
+    Seq2SeqTrainingArguments,
+    Trainer,
+    is_torch_tpu_available,
+    set_seed,
+)
 from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.utils.versions import require_version
 
@@ -587,47 +596,54 @@ def main():
 
     else:
         data_files = {}
-
         dataset_args = {}
+        if data_args.train_data is not None:
+            train_dof = [s.strip() for s in data_args.train_data.strip().split(",")]
+        else:
+            raise ValueError("train data should not be none")
+        # direcotory_or_file
+        train_files = []
+        for dof in train_dof:
+            if os.path.exists(dof) and os.path.isfile(dof):
+                train_files.append(dof)
+            elif os.path.exists(dof) and os.path.isdir(dof):
+                files = (
+                    glob.glob(f"{dof}/**/*.txt", recursive=True)
+                    + glob.glob(f"{dof}/**/*.json", recursive=True)
+                    + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                )
+                types = [f.split(".")[-1] for f in files]
+                if len(set(types)) > 1:
+                    raise ValueError(f"train files must be same type, e.g. all txt or all jsonl, but got {types}")
+                train_files.extend(files)
+            else:
+                raise ValueError("train data should be valid file path or direcotory path split by ','")
+        data_files["train"] = train_files
 
-        if data_args.train_file_dir is not None and os.path.exists(data_args.train_file_dir):
-            train_data_files = (
-                glob(f"{data_args.train_file_dir}/**/*.txt", recursive=True)
-                + glob(f"{data_args.train_file_dir}/**/*.json", recursive=True)
-                + glob(f"{data_args.train_file_dir}/**/*.jsonl", recursive=True)
-            )
+        if data_args.dev_data is not None:
+            dev_dof = [s.strip() for s in data_args.dev_data.split(",")]
+            dev_files = []
+            for dof in dev_dof:
+                if os.path.exists(dof) and os.path.isfile(dof):
+                    dev_files.append(dof)
+                elif os.path.exists(dof) and os.path.isdir(dof):
+                    files = (
+                        glob.glob(f"{dof}/**/*.txt", recursive=True)
+                        + glob.glob(f"{dof}/**/*.json", recursive=True)
+                        + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                    )
+                    types = [f.split(".")[-1] for f in files]
+                    if len(set(types)) > 1:
+                        raise ValueError(f"train files must be same type, e.g. all txt or all jsonl, but got {types}")
+                    dev_files.extend(files)
+                else:
+                    raise ValueError("train data should be valid file path or direcotory path split by ','")
+            logger.info(f"eval files: {dev_files}")
+            data_files["validation"] = dev_files
 
-            logger.info(f"train files: {train_data_files}")
-
-            # Train data files must be same type, e.g. all txt or all jsonl
-
-            types = [f.split(".")[-1] for f in train_data_files]
-
-            if len(set(types)) > 1:
-                raise ValueError(f"train files must be same type, e.g. all txt or all jsonl, but got {types}")
-
-            data_files["train"] = train_data_files
-
-        if data_args.validation_file_dir is not None and os.path.exists(data_args.validation_file_dir):
-            eval_data_files = (
-                glob(f"{data_args.validation_file_dir}/**/*.txt", recursive=True)
-                + glob(f"{data_args.validation_file_dir}/**/*.json", recursive=True)
-                + glob(f"{data_args.validation_file_dir}/**/*.jsonl", recursive=True)
-            )
-
-            logger.info(f"eval files: {eval_data_files}")
-
-            data_files["validation"] = eval_data_files
-
-            # Train data files must be same type, e.g. all txt or all jsonl
-
-            types = [f.split(".")[-1] for f in eval_data_files]
-
-            if len(set(types)) > 1:
-                raise ValueError(f"train files must be same type, e.g. all txt or all jsonl, but got {types}")
+        logger.info(f"loading data files={data_files}")
 
         extension = "text" if data_files["train"][0].endswith("txt") else "json"
-
         if extension == "text":
             dataset_args["keep_linebreaks"] = data_args.keep_linebreaks
 
@@ -753,13 +769,6 @@ def main():
             else getattr(torch, model_args.torch_dtype)
         )
 
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-
-        ddp = world_size != 1
-
-        if ddp:
-            model_args.device_map = {"": int(os.environ.get("LOCAL_RANK", "0"))}
-
         if script_args.qlora and (len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled()):
             logger.warning("FSDP and ZeRO3 are both currently incompatible with QLoRA.")
 
@@ -785,11 +794,9 @@ def main():
         model = model_class.from_pretrained(
             model_args.model_name_or_path,
             config=config,
-            torch_dtype=torch_dtype,
+            torch_dtype="auto",
             load_in_4bit=load_in_4bit,
             load_in_8bit=load_in_8bit,
-            low_cpu_mem_usage=(not is_deepspeed_zero3_enabled()),
-            device_map=model_args.device_map,
             trust_remote_code=model_args.trust_remote_code,
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=load_in_4bit,
@@ -838,7 +845,6 @@ def main():
                     model.resize_token_embeddings(len(tokenizer))
 
             logger.info(f"Peft target_modules: {target_modules}")
-
             logger.info(f"Peft lora_rank: {script_args.lora_rank}")
 
             peft_config = LoraConfig(
@@ -866,20 +872,13 @@ def main():
 
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
-
         model.config.use_cache = False
-
     else:
         model.config.use_cache = True
-
     model.enable_input_require_grads()
 
-    if not ddp and torch.cuda.device_count() > 1:
-        # Keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
-
-        model.is_parallelizable = True
-
-        model.model_parallel = True
+    model.is_parallelizable = True
+    model.model_parallel = True
 
     trainer = SavePeftModelTrainer(
         model=model,
@@ -939,23 +938,15 @@ def main():
 
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
-
         metrics = trainer.evaluate()
-
         metrics["eval_samples"] = max_eval_samples
-
         try:
             perplexity = math.exp(metrics["eval_loss"])
-
         except OverflowError:
             perplexity = float("inf")
-
         metrics["perplexity"] = perplexity
-
         trainer.log_metrics("eval", metrics)
-
         trainer.save_metrics("eval", metrics)
-
         if trainer.is_world_process_zero():
             logger.debug(f"Eval metrics: {metrics}")
 
