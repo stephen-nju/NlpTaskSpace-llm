@@ -3,40 +3,45 @@
 
 import argparse
 import functools
+import glob
 import os
 from types import MethodType
 from typing import Any, Dict, Tuple, Union
 
-import datasets
 import torch
 from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning import LightningModule, Trainer, seed_everything
 from lightning.pytorch.strategies import DeepSpeedStrategy, FSDPStrategy
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from peft import (LoraConfig, TaskType, get_peft_model,
+                  prepare_model_for_kbit_training)
 from rouge_chinese import Rouge
 from torch.utils.data import DataLoader, Dataset
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    DataCollatorForSeq2Seq,
-    get_cosine_schedule_with_warmup,
-    get_linear_schedule_with_warmup,
-    get_polynomial_decay_schedule_with_warmup,
-)
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
+                          BitsAndBytesConfig, DataCollatorForSeq2Seq,
+                          get_cosine_schedule_with_warmup,
+                          get_linear_schedule_with_warmup,
+                          get_polynomial_decay_schedule_with_warmup)
 
 from llm.src.callbacks import HFModelCheckpoint
 from llm.src.constant import IGNORE_INDEX
 from llm.src.datasets.preprocessing import (
-    preprocess_supervised_dataset_test,
-    preprocess_supervised_dataset_train,
-)
-from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
+    preprocess_packed_supervised_dataset_train,
+    preprocess_supervised_dataset_test, preprocess_supervised_dataset_train)
+from llm.src.datasets.template import (get_template_and_fix_tokenizer,
+                                       register_template)
 from llm.src.utils import find_all_linear_names
 from metrics.language_model import LanguageModelMetric
+
+register_template(
+    name="yi",
+    prefix=["{{system}}"],
+    prompt=["<|im_start|>user\n{{query}}<|im_end|>\n<|im_start|>assistant"],
+    system="",
+    sep=["<|im_end|>\n"],
+    efficient_eos=True,
+)
 
 
 class SupervisedFintuningModule(LightningModule):
@@ -49,9 +54,8 @@ class SupervisedFintuningModule(LightningModule):
             use_fast=not args.use_slow_tokenizer,
             trust_remote_code=True,
         )
-
         self.llm_metrics = LanguageModelMetric()
-        self.template = get_template_and_fix_tokenizer("baichuan2", self.tokenizer)
+        self.template = get_template_and_fix_tokenizer("yi", self.tokenizer)
         self.save_hyperparameters()
 
     def configure_model(self):
@@ -173,20 +177,93 @@ class SupervisedFintuningModule(LightningModule):
         )
 
     def setup(self, stage):
-        data_files = {}
-        data_files["train"] = [train.strip() for train in self.args.train_data.strip().split(",")]
-        data_files["validation"] = [dev.strip() for dev in self.args.dev_data.strip().split(",")]
-        self.print(f"loading datafiles ={data_files}")
+        if self.args.dataset_name is not None:
+            raw_datasets = load_dataset(
+                self.args.dataset_name,
+                self.args.dataset_config_name,
+                streaming=self.args.streaming,
+            )
+            if "validation" not in raw_datasets.keys():
+                raw_datasets["validation"] = load_dataset(
+                    self.args.dataset_name,
+                    self.args.dataset_config_name,
+                    split=f"train[:{self.args.validation_split_percentage}%]",
+                    streaming=self.args.streaming,
+                )
 
-        raw_datasets = load_dataset("json", data_files=data_files)
+                raw_datasets["train"] = load_dataset(
+                    self.args.dataset_name,
+                    self.args.dataset_config_name,
+                    split=f"train[{self.args.validation_split_percentage}%:]",
+                    streaming=self.args.streaming,
+                )
+        else:
+            data_files = {}
+            dataset_args = {}
+            if self.args.train_data is not None:
+                train_dof = [s.strip() for s in self.args.train_data.strip().split(",")]
+            else:
+                raise ValueError("train data should not be none")
+            # direcotory_or_file
+            train_files = []
+            for dof in train_dof:
+                if os.path.exists(dof) and os.path.isfile(dof):
+                    train_files.append(dof)
+                elif os.path.exists(dof) and os.path.isdir(dof):
+                    files = (
+                        glob.glob(f"{dof}/**/*.txt", recursive=True)
+                        + glob.glob(f"{dof}/**/*.json", recursive=True)
+                        + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                    )
+                    types = [f.split(".")[-1] for f in files]
+                    if len(set(types)) > 1:
+                        raise ValueError(f"train files must be same type, e.g. all txt or all jsonl, but got {types}")
+                    train_files.extend(files)
+                else:
+                    raise ValueError("train data should be valid file path or direcotory path split by ','")
+            data_files["train"] = train_files
+
+            if self.args.dev_data is not None:
+                dev_dof = [s.strip() for s in self.args.dev_data.split(",")]
+                dev_files = []
+                for dof in dev_dof:
+                    if os.path.exists(dof) and os.path.isfile(dof):
+                        dev_files.append(dof)
+                    elif os.path.exists(dof) and os.path.isdir(dof):
+                        files = (
+                            glob.glob(f"{dof}/**/*.txt", recursive=True)
+                            + glob.glob(f"{dof}/**/*.json", recursive=True)
+                            + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                        )
+
+                        types = [f.split(".")[-1] for f in files]
+                        if len(set(types)) > 1:
+                            raise ValueError(
+                                f"train files must be same type, e.g. all txt or all jsonl, but got {types}"
+                            )
+                        dev_files.extend(files)
+                    else:
+                        raise ValueError("train data should be valid file path or direcotory path split by ','")
+                self.trainer.print(f"eval files: {dev_files}")
+                data_files["validation"] = dev_files
+
+            extension = "text" if data_files["train"][0].endswith("txt") else "json"
+            if extension == "text":
+                dataset_args["keep_linebreaks"] = not self.args.no_keep_linebreaks
+
+            self.trainer.print(f"loading data files={data_files}")
+            raw_datasets = load_dataset(extension, data_files=data_files)
 
         preprocessing_function_train = functools.partial(
-            preprocess_supervised_dataset_train,
+            preprocess_packed_supervised_dataset_train
+            if self.args.sft_packing
+            else preprocess_supervised_dataset_train,
             tokenizer=self.tokenizer,
             template=self.template,
             max_source_length=self.args.max_source_length,
             max_target_length=self.args.max_target_length,
         )
+
         column_names = raw_datasets["train"].column_names
         self.train_dataset = raw_datasets["train"].map(
             preprocessing_function_train,
@@ -196,7 +273,6 @@ class SupervisedFintuningModule(LightningModule):
             load_from_cache_file=not self.args.overwrite_cache,
             desc="Running tokenizer on train dataset",
         )
-
         self.print_example(self.train_dataset[0])
 
         preprocessing_function_test = functools.partial(
@@ -222,7 +298,7 @@ class SupervisedFintuningModule(LightningModule):
             num_proc=self.args.preprocessing_num_workers,
             remove_columns=column_names,
             load_from_cache_file=not self.args.overwrite_cache,
-            desc="Running tokenizer on test dataset for testing",
+            desc="Running tokenizer on test dataset",
         )
 
     @property
@@ -341,7 +417,7 @@ class SupervisedFintuningModule(LightningModule):
         # ) * self.args.max_epochs
 
         t_total = self.trainer.estimated_stepping_batches
-        warmup_steps = int(self.args.warmup_proportion * t_total)
+        warmup_steps = int(self.args.warmup_ratio * t_total)
         # print(f"totla={t_total},step_batch={stepping_batches},w={warmup_steps},warm_up=={warmup_steps}")
 
         if self.args.lr_scheduler_type == "onecycle":
@@ -667,4 +743,3 @@ if __name__ == "__main__":
         accumulate_grad_batches=arg.gradient_accumulation_steps,
     )
     trainer.fit(model)
-    trainer.test(model)

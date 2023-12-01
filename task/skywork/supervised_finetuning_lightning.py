@@ -1,5 +1,6 @@
 import argparse
 import functools
+import glob
 import os
 from types import MethodType
 from typing import Any, Dict, Tuple, Union
@@ -20,8 +21,6 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     DataCollatorForSeq2Seq,
-    DefaultDataCollator,
-    GenerationConfig,
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup,
@@ -45,7 +44,6 @@ register_template(
     system="You are a helpful assistant. 你是一个乐于助人的助手。",
     sep=[],
 )
-# PROMPT_TEMPLATE = "[INST] <<SYS>>\n" "You are a helpful assistant. 你是一个乐于助人的助手。\n" "<</SYS>>\n\n{instruction} [/INST]"
 
 
 class SupervisedFintuningModule(LightningModule):
@@ -60,7 +58,7 @@ class SupervisedFintuningModule(LightningModule):
         )
 
         self.llm_metrics = LanguageModelMetric()
-        self.template = get_template_and_fix_tokenizer("qwen", self.tokenizer)
+        self.template = get_template_and_fix_tokenizer("skywork-chat-llama2", self.tokenizer)
         self.save_hyperparameters()
 
         # def configure_model(self):
@@ -182,12 +180,83 @@ class SupervisedFintuningModule(LightningModule):
         )
 
     def setup(self, stage):
-        data_files = {}
-        data_files["train"] = [train.strip() for train in self.args.train_data.strip().split(",")]
-        data_files["validation"] = [dev.strip() for dev in self.args.dev_data.strip().split(",")]
-        self.print(f"loading datafiles ={data_files}")
+        if self.args.dataset_name is not None:
+            raw_datasets = load_dataset(
+                self.args.dataset_name,
+                self.args.dataset_config_name,
+                streaming=self.args.streaming,
+            )
+            if "validation" not in raw_datasets.keys():
+                raw_datasets["validation"] = load_dataset(
+                    self.args.dataset_name,
+                    self.args.dataset_config_name,
+                    split=f"train[:{self.args.validation_split_percentage}%]",
+                    streaming=self.args.streaming,
+                )
 
-        raw_datasets = load_dataset("json", data_files=data_files)
+                raw_datasets["train"] = load_dataset(
+                    self.args.dataset_name,
+                    self.args.dataset_config_name,
+                    split=f"train[{self.args.validation_split_percentage}%:]",
+                    streaming=self.args.streaming,
+                )
+        else:
+            data_files = {}
+            dataset_args = {}
+            if self.args.train_data is not None:
+                train_dof = [s.strip() for s in self.args.train_data.strip().split(",")]
+            else:
+                raise ValueError("train data should not be none")
+            # direcotory_or_file
+            train_files = []
+            for dof in train_dof:
+                if os.path.exists(dof) and os.path.isfile(dof):
+                    train_files.append(dof)
+                elif os.path.exists(dof) and os.path.isdir(dof):
+                    files = (
+                        glob.glob(f"{dof}/**/*.txt", recursive=True)
+                        + glob.glob(f"{dof}/**/*.json", recursive=True)
+                        + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                    )
+                    types = [f.split(".")[-1] for f in files]
+                    if len(set(types)) > 1:
+                        raise ValueError(f"train files must be same type, e.g. all txt or all jsonl, but got {types}")
+                    train_files.extend(files)
+                else:
+                    raise ValueError("train data should be valid file path or direcotory path split by ','")
+            data_files["train"] = train_files
+
+            if self.args.dev_data is not None:
+                dev_dof = [s.strip() for s in self.args.dev_data.split(",")]
+                dev_files = []
+                for dof in dev_dof:
+                    if os.path.exists(dof) and os.path.isfile(dof):
+                        dev_files.append(dof)
+                    elif os.path.exists(dof) and os.path.isdir(dof):
+                        files = (
+                            glob.glob(f"{dof}/**/*.txt", recursive=True)
+                            + glob.glob(f"{dof}/**/*.json", recursive=True)
+                            + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                        )
+
+                        types = [f.split(".")[-1] for f in files]
+                        if len(set(types)) > 1:
+                            raise ValueError(
+                                f"train files must be same type, e.g. all txt or all jsonl, but got {types}"
+                            )
+                        dev_files.extend(files)
+                    else:
+                        raise ValueError("train data should be valid file path or direcotory path split by ','")
+                self.trainer.print(f"eval files: {dev_files}")
+                data_files["validation"] = dev_files
+
+            extension = "text" if data_files["train"][0].endswith("txt") else "json"
+            if extension == "text":
+                dataset_args["keep_linebreaks"] = not self.args.no_keep_linebreaks
+
+            self.trainer.print(f"loading data files={data_files}")
+            raw_datasets = load_dataset(extension, data_files=data_files)
+
         preprocessing_function_train = functools.partial(
             preprocess_packed_supervised_dataset_train
             if self.args.sft_packing
@@ -198,6 +267,7 @@ class SupervisedFintuningModule(LightningModule):
             max_target_length=self.args.max_target_length,
         )
         column_names = raw_datasets["train"].column_names
+
         self.train_dataset = raw_datasets["train"].map(
             preprocessing_function_train,
             batched=True,
@@ -206,7 +276,6 @@ class SupervisedFintuningModule(LightningModule):
             load_from_cache_file=not self.args.overwrite_cache,
             desc="Running tokenizer on train dataset",
         )
-
         self.print_example(self.train_dataset[0])
 
         preprocessing_function_test = functools.partial(
@@ -232,7 +301,7 @@ class SupervisedFintuningModule(LightningModule):
             num_proc=self.args.preprocessing_num_workers,
             remove_columns=column_names,
             load_from_cache_file=not self.args.overwrite_cache,
-            desc="Running tokenizer on test dataset for testing",
+            desc="Running tokenizer on test dataset",
         )
 
     @property
@@ -398,10 +467,32 @@ if __name__ == "__main__":
         default="./output_dir/",
         help="path to save model and checkpoint .it is the root dir",
     )
+    parser.add_argument("--train_data", type=str, default=None, help="the input train file or train data directory")
+    parser.add_argument("--test_data", type=str, default=None, help="test data path")
+    parser.add_argument("--dev_data", type=str, default=None, help="dev data path")
+    parser.add_argument(
+        "--dataset_name", type=str, default=None, help="The name of the dataset to use (via the datasets library)."
+    )
+    parser.add_argument(
+        "--dataset_config_name",
+        type=str,
+        default=None,
+        help="The configuration name of the dataset to use (via the datasets library).",
+    )
+    parser.add_argument(
+        "--max_train_samples", type=int, default=None, help="truncate the number of training examples to this"
+    )
+    parser.add_argument(
+        "--max_eval_samples", type=int, default=None, help=" truncate the number of evaluation examples to this"
+    )
 
-    parser.add_argument("--train_data", type=str, default="", help="the input train file or train data directory")
-    parser.add_argument("--test_data", type=str, default="", help="test data path")
-    parser.add_argument("--dev_data", type=str, default="", help="dev data path")
+    parser.add_argument("--streaming", action="store_true", help="Enable streaming mode")
+    parser.add_argument(
+        "--validation_split_percentage",
+        type=int,
+        default=1,
+        help="The percentage of the train set used as validation set in case there's no validation split",
+    )
     parser.add_argument(
         "--model_name_or_path",
         type=str,
@@ -415,10 +506,17 @@ if __name__ == "__main__":
         default=None,
     )
     parser.add_argument(
+        "--checkpointing_steps",
+        type=str,
+        default=None,
+        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
+    )
+    parser.add_argument(
         "--save_steps",
         type=int,
         default=500,
     )
+    parser.add_argument("--save_total_limit", type=int, default=None, help="save total limit")
 
     parser.add_argument(
         "--lr_scheduler_type",
@@ -434,7 +532,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--workers", type=int, default=0, help="num workers for dataloader")
     parser.add_argument(
-        "--warmup_proportion",
+        "--warmup_ratio",
         default=0.1,
         type=float,
         help="warmup steps used for scheduler.",
@@ -524,12 +622,6 @@ if __name__ == "__main__":
         help="Do not keep line breaks when using TXT files.",
     )
     parser.add_argument(
-        "--checkpointing_steps",
-        type=str,
-        default=None,
-        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
-    )
-    parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
         default=None,
@@ -574,12 +666,11 @@ if __name__ == "__main__":
         help="quantization training like 4bit 8bit",
     )
     parser.add_argument("--use_lora", type=bool, default=True, help="using lora")
-
     parser.add_argument("--lora_rank", type=int, default=8, help="The intrinsic dimension for LoRA fine-tuning.")
     parser.add_argument(
         "--lora_alpha",
         type=float,
-        default=32,
+        default=None,
         help="The scale factor for LoRA fine-tuning (similar with the learning rate)",
     )
     parser.add_argument("--lora_dropout", type=float, default=0.1, help="")
@@ -596,13 +687,10 @@ if __name__ == "__main__":
         "--sft_packing", action="store_true", help="packing multi round qa in supervised  fintuning stage"
     )
     arg = parser.parse_args()
-    # 检查会冲突的参数
-    if arg.deepspeed and arg.fsdp:
-        # 训练策略智能选一个
-        raise ValueError("Either --deepspeed or --fsdp has to be provided")
 
     if arg.seed is not None:
         seed_everything(arg.seed)
+
     # 先加载模型，再加载数据
     model = SupervisedFintuningModule(arg)
 
@@ -612,24 +700,45 @@ if __name__ == "__main__":
         strategy = FSDPStrategy()
     else:
         strategy = "auto"
-
     # 添加常用的checkpoint
+
     callbacks = []
-    checkpoint = HFModelCheckpoint(
-        monitor="train_loss",
-        dirpath=arg.output_dir,
-        every_n_train_steps=arg.save_steps,
-        filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
-        save_last=True,
-        save_hf=True,
-    )
-    callbacks.append(checkpoint)
+    if arg.checkpointing_steps == "epoch":
+        checkpoint = HFModelCheckpoint(
+            dirpath=arg.output_dir,
+            filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
+            save_last=True,
+            save_top_k=-1,
+            every_n_epochs=1,
+        )
+        callbacks.append(checkpoint)
+    else:
+        if arg.save_steps is not None and arg.save_total_limit is None:
+            every_n_train_steps = arg.save_steps
+            save_top_k = -1
+        elif arg.save_steps is not None and arg.save_total_limit is not None:
+            every_n_train_steps = arg.save_steps
+            save_top_k = arg.save_total_limit
+        else:
+            every_n_train_steps = None
+            save_top_k = None
+
+        checkpoint = HFModelCheckpoint(
+            monitor="step",
+            mode="max",
+            dirpath=arg.output_dir,
+            filename="sn-generate-{step:02d}-{train_loss:.2f}",
+            every_n_train_steps=every_n_train_steps,
+            save_top_k=save_top_k,
+            save_on_train_epoch_end=True,
+            save_hf=True,
+        )
+        callbacks.append(checkpoint)
 
     trainer = Trainer(
         devices="auto",
         max_epochs=arg.max_epochs,
         strategy=strategy,
-        max_steps=arg.max_steps,
         callbacks=callbacks,
         log_every_n_steps=1,
         num_sanity_val_steps=0,
@@ -637,5 +746,3 @@ if __name__ == "__main__":
         accumulate_grad_batches=arg.gradient_accumulation_steps,
     )
     trainer.fit(model)
-
-    trainer.test(model)

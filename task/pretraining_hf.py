@@ -214,19 +214,12 @@ class DataArguments:
 @dataclass
 class ScriptArguments:
     use_peft: bool = field(default=True, metadata={"help": "Whether to use peft"})
-
     target_modules: Optional[str] = field(default="all")
-
     lora_rank: Optional[int] = field(default=8)
-
     lora_dropout: Optional[float] = field(default=0.05)
-
     lora_alpha: Optional[float] = field(default=32.0)
-
     modules_to_save: Optional[str] = field(default=None)
-
     peft_path: Optional[str] = field(default=None)
-
     qlora: bool = field(default=False, metadata={"help": "Whether to use qlora"})
 
 
@@ -238,55 +231,37 @@ def accuracy(predictions, references, normalize=True, sample_weight=None):
 
 def compute_metrics(eval_preds):
     preds, labels = eval_preds
-
     # preds have the same shape as the labels, after the argmax(-1) has been calculated
-
     # by preprocess_logits_for_metrics, we need to shift the labels
-
     labels = labels[:, 1:].reshape(-1)
-
     preds = preds[:, :-1].reshape(-1)
-
     return accuracy(predictions=preds, references=labels)
 
 
 def preprocess_logits_for_metrics(logits, labels):
     if isinstance(logits, tuple):
         # Depending on the model and config, logits may contain extra tensors,
-
         # like past_key_values, but logits always come first
-
         logits = logits[0]
-
     return logits.argmax(dim=-1)
 
 
 def fault_tolerance_data_collator(features: List) -> Dict[str, Any]:
     if not isinstance(features[0], Mapping):
         features = [vars(f) for f in features]
-
     first = features[0]
-
     batch = {}
-
     # Special handling for labels.
-
     # Ensure that tensor is created with the correct type
-
     if "label" in first and first["label"] is not None:
         label = first["label"].item() if isinstance(first["label"], torch.Tensor) else first["label"]
-
         dtype = torch.long if isinstance(label, int) else torch.float
-
         batch["labels"] = torch.tensor([f["label"] for f in features], dtype=dtype)
-
     elif "label_ids" in first and first["label_ids"] is not None:
         if isinstance(first["label_ids"], torch.Tensor):
             batch["labels"] = torch.stack([f["label_ids"] for f in features])
-
         else:
             dtype = torch.long if type(first["label_ids"][0]) is int else torch.float
-
             batch["labels"] = torch.tensor([f["label_ids"] for f in features], dtype=dtype)
 
     # Handling of all other possible keys.
@@ -298,73 +273,32 @@ def fault_tolerance_data_collator(features: List) -> Dict[str, Any]:
             if k not in ("label", "label_ids") and v is not None and not isinstance(v, str):
                 if isinstance(v, torch.Tensor):
                     batch[k] = torch.stack([f[k] for f in features])
-
                 elif isinstance(v, np.ndarray):
                     batch[k] = torch.tensor(np.stack([f[k] for f in features]))
-
                 else:
                     batch[k] = torch.tensor([f[k] for f in features])
-
     except ValueError:  # quick fix by simply take the first example
         for k, v in first.items():
             if k not in ("label", "label_ids") and v is not None and not isinstance(v, str):
                 if isinstance(v, torch.Tensor):
                     batch[k] = torch.stack([features[0][k]] * len(features))
-
                 elif isinstance(v, np.ndarray):
                     batch[k] = torch.tensor(np.stack([features[0][k]] * len(features)))
-
                 else:
                     batch[k] = torch.tensor([features[0][k]] * len(features))
 
     return batch
 
 
-class GroupTextsBuilder:
-    def __init__(self, max_seq_length):
-        self.max_seq_length = max_seq_length
-
-    def __call__(self, examples):
-        # Concatenate all texts.
-
-        firsts = {k: examples[k][0][0] for k in examples.keys()}
-
-        lasts = {k: examples[k][0][-1] for k in examples.keys()}
-
-        contents = {k: sum([vi[1:-1] for vi in v], []) for k, v in examples.items()}
-
-        total_length = len(contents[list(examples.keys())[0]])
-
-        content_length = self.max_seq_length - 2
-
-        if total_length >= content_length:
-            total_length = (total_length // content_length) * content_length
-
-        # Split by chunks of max_len.
-
-        result = {
-            k: [[firsts[k]] + t[i : i + content_length] + [lasts[k]] for i in range(0, total_length, content_length)]
-            for k, t in contents.items()
-        }
-
-        return result
-
-
 class SavePeftModelTrainer(Trainer):
-
     """
-
     Trainer for lora models
-
     """
 
     def save_model(self, output_dir=None, _internal_call=False):
         """Save the LoRA model."""
-
         os.makedirs(output_dir, exist_ok=True)
-
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
-
         self.model.save_pretrained(output_dir)
 
 
@@ -372,35 +306,22 @@ def save_model(model, tokenizer, args):
     """Save the model and the tokenizer."""
 
     output_dir = args.output_dir
-
     os.makedirs(output_dir, exist_ok=True)
-
     # Take care of distributed/parallel training
-
     model_to_save = model.module if hasattr(model, "module") else model
-
     model_to_save.save_pretrained(output_dir)
-
     tokenizer.save_pretrained(output_dir)
 
 
 def save_model_zero3(model, tokenizer, args, trainer):
     """Save the model for deepspeed zero3.
-
     refer https://github.com/lm-sys/FastChat/blob/main/fastchat/train/train_lora.py#L209
-
     """
-
     output_dir = args.output_dir
-
     os.makedirs(output_dir, exist_ok=True)
-
     state_dict_zero3 = trainer.model_wrapped._zero3_consolidated_16bit_state_dict()
-
     model_to_save = model.module if hasattr(model, "module") else model
-
     model_to_save.save_pretrained(args.output_dir, state_dict=state_dict_zero3)
-
     tokenizer.save_pretrained(output_dir)
 
 
@@ -412,12 +333,9 @@ def print_trainable_parameters(model):
     """
 
     trainable_params = 0
-
     all_param = 0
-
     for _, param in model.named_parameters():
         all_param += param.numel()
-
         if param.requires_grad:
             trainable_params += param.numel()
 
@@ -430,82 +348,59 @@ def find_all_linear_names(peft_model, int4=False, int8=False):
     """Find all linear layer names in the model. reference from qlora paper."""
 
     cls = torch.nn.Linear
-
     if int4 or int8:
         import bitsandbytes as bnb
 
         if int4:
             cls = bnb.nn.Linear4bit
-
         elif int8:
             cls = bnb.nn.Linear8bitLt
-
     lora_module_names = set()
 
     for name, module in peft_model.named_modules():
         if isinstance(module, cls):
             # last layer is not add to lora_module_names
-
             if "lm_head" in name:
                 continue
-
             if "output_layer" in name:
                 continue
-
             names = name.split(".")
-
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-
     return sorted(lora_module_names)
 
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, Seq2SeqTrainingArguments, ScriptArguments))
-
     model_args, data_args, training_args, script_args = parser.parse_args_into_dataclasses()
-
     logger.info(f"Model args: {model_args}")
-
     logger.info(f"Data args: {data_args}")
-
     logger.info(f"Training args: {training_args}")
-
     logger.info(f"Script args: {script_args}")
-
     logger.info(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
         + f" distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
 
     # Set seed before initializing model.
-
     set_seed(training_args.seed)
-
     # Load tokenizer
-
     config_class, model_class, tokenizer_class = MODEL_CLASSES[model_args.model_type]
-
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
         "trust_remote_code": model_args.trust_remote_code,
     }
-
     tokenizer_name_or_path = model_args.tokenizer_name_or_path
-
     if not tokenizer_name_or_path:
         tokenizer_name_or_path = model_args.model_name_or_path
-
     tokenizer = tokenizer_class.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)
 
     # Preprocessing the datasets.
-
     def tokenize_function(examples):
         return tokenizer(examples["text"])
 
     if data_args.block_size is None:
         block_size = tokenizer.model_max_length
-
         if block_size > 2048:
             logger.warning(
                 "The chosen tokenizer supports a `model_max_length` that is longer than the default `block_size` value"
@@ -528,55 +423,36 @@ def main():
         # Concatenate all texts.
 
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-
         total_length = len(concatenated_examples[list(examples.keys())[0]])
-
         # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-
         # customize this part to your needs.
-
         if total_length >= block_size:
             total_length = (total_length // block_size) * block_size
-
         # Split by chunks of max_len.
-
         result = {
             k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
             for k, t in concatenated_examples.items()
         }
-
         result["labels"] = result["input_ids"].copy()
-
         return result
 
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
-
     # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-
     # (the dataset will be downloaded automatically from the datasets Hub).
-
     #
-
     # For CSV/JSON files, this script will use the column called 'text' or the first column if no column called
-
     # 'text' is found. You can easily tweak this behavior (see below).
-
     #
-
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-
     # download the dataset.
-
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-
         raw_datasets = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
             cache_dir=model_args.cache_dir,
             streaming=data_args.streaming,
         )
-
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
                 data_args.dataset_name,
@@ -642,7 +518,6 @@ def main():
             data_files["validation"] = dev_files
 
         logger.info(f"loading data files={data_files}")
-
         extension = "text" if data_files["train"][0].endswith("txt") else "json"
         if extension == "text":
             dataset_args["keep_linebreaks"] = data_args.keep_linebreaks
@@ -715,49 +590,34 @@ def main():
             )
 
     train_dataset = None
-
     max_train_samples = 0
-
     if training_args.do_train:
         if "train" not in tokenized_datasets:
             raise ValueError("--do_train requires a train dataset")
-
         train_dataset = lm_datasets["train"]
-
         max_train_samples = len(train_dataset)
-
         if data_args.max_train_samples is not None and data_args.max_train_samples > 0:
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
-
             train_dataset = train_dataset.select(range(max_train_samples))
 
         logger.debug(f"Num train_samples: {len(train_dataset)}")
-
         logger.debug("Tokenized training example:")
-
         logger.debug(tokenizer.decode(train_dataset[0]["input_ids"]))
-
     eval_dataset = None
 
     max_eval_samples = 0
-
     if training_args.do_eval:
         if "validation" not in tokenized_datasets:
             raise ValueError("--do_eval requires a validation dataset")
 
         eval_dataset = lm_datasets["validation"]
-
         max_eval_samples = len(eval_dataset)
-
         if data_args.max_eval_samples is not None and data_args.max_eval_samples > 0:
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
-
             eval_dataset = eval_dataset.select(range(max_eval_samples))
 
         logger.debug(f"Num eval_samples: {len(eval_dataset)}")
-
         logger.debug("Tokenized eval example:")
-
         logger.debug(tokenizer.decode(eval_dataset[0]["input_ids"]))
 
     # Load model
@@ -811,7 +671,7 @@ def main():
         )
 
     else:
-        raise ValueError(f"Error, model_name_or_path is None, Continue PT must be loaded from a pre-trained model")
+        raise ValueError("Error, model_name_or_path is None, Continue PT must be loaded from a pre-trained model")
 
     if script_args.use_peft:
         logger.info("Fine-tuning method: LoRA(PEFT)")
@@ -828,19 +688,13 @@ def main():
                 model = prepare_model_for_kbit_training(model, training_args.gradient_checkpointing)
 
             target_modules = script_args.target_modules.split(",") if script_args.target_modules else None
-
             if target_modules and "all" in target_modules:
                 target_modules = find_all_linear_names(model, int4=load_in_4bit, int8=load_in_8bit)
-
             modules_to_save = script_args.modules_to_save
-
             if modules_to_save is not None:
                 modules_to_save = modules_to_save.split(",")
-
                 # Resize the embedding layer to match the new tokenizer
-
                 embedding_size = model.get_input_embeddings().weight.shape[0]
-
                 if len(tokenizer) > embedding_size:
                     model.resize_token_embeddings(len(tokenizer))
 
@@ -856,18 +710,13 @@ def main():
                 lora_dropout=script_args.lora_dropout,
                 modules_to_save=modules_to_save,
             )
-
             model = get_peft_model(model, peft_config)
-
         model.print_trainable_parameters()
 
     else:
         logger.info("Fine-tuning method: Full parameters training")
-
         model = model.float()
-
         print_trainable_parameters(model)
-
     # Initialize our Trainer
 
     if training_args.gradient_checkpointing:

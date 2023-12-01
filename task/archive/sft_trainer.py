@@ -14,10 +14,18 @@ import bitsandbytes as bnb
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
-                          BitsAndBytesConfig, DataCollatorForSeq2Seq,
-                          HfArgumentParser, Seq2SeqTrainer, Trainer,
-                          TrainingArguments, set_seed)
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    DataCollatorForSeq2Seq,
+    HfArgumentParser,
+    Seq2SeqTrainer,
+    Trainer,
+    TrainingArguments,
+    set_seed,
+)
 from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger()

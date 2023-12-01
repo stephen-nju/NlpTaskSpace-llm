@@ -464,8 +464,6 @@ class SupervisedFintuningModule(LightningModule):
     def validation_step(self, batch, batch_idx):
         output = self.model(**batch)
         preds = self.preprocess_logits_for_metrics(output.logits)
-        self.log("eval_step_loss", output.loss, on_step=True, prog_bar=True, sync_dist=True)
-
         labels = batch["labels"]
         labels = labels[:, 1:].reshape(-1)
         preds = preds[:, :-1].reshape(-1)
@@ -475,7 +473,7 @@ class SupervisedFintuningModule(LightningModule):
         except OverflowError:
             perplexity = float("inf")
 
-        self.log("eval_loss", output.loss, on_epoch=True, sync_dist=True)
+        self.log("eval_loss", output.loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log("ppl", perplexity, on_epoch=True, sync_dist=True)
 
     def on_validation_epoch_end(self):
