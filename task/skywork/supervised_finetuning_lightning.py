@@ -12,28 +12,23 @@ from lightning import LightningModule, Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.strategies import DeepSpeedStrategy, FSDPStrategy
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from peft import (LoraConfig, TaskType, get_peft_model,
+                  prepare_model_for_kbit_training)
 from rouge_chinese import Rouge
 from torch.utils.data import DataLoader, Dataset
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    DataCollatorForSeq2Seq,
-    get_cosine_schedule_with_warmup,
-    get_linear_schedule_with_warmup,
-    get_polynomial_decay_schedule_with_warmup,
-)
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
+                          BitsAndBytesConfig, DataCollatorForSeq2Seq,
+                          get_cosine_schedule_with_warmup,
+                          get_linear_schedule_with_warmup,
+                          get_polynomial_decay_schedule_with_warmup)
 
 from llm.src.callbacks import HFModelCheckpoint
 from llm.src.constant import IGNORE_INDEX
 from llm.src.datasets.preprocessing import (
     preprocess_packed_supervised_dataset_train,
-    preprocess_supervised_dataset_test,
-    preprocess_supervised_dataset_train,
-)
-from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
+    preprocess_supervised_dataset_test, preprocess_supervised_dataset_train)
+from llm.src.datasets.template import (get_template_and_fix_tokenizer,
+                                       register_template)
 from llm.src.utils import find_all_linear_names
 from metrics.language_model import LanguageModelMetric
 
@@ -61,7 +56,25 @@ class SupervisedFintuningModule(LightningModule):
         self.template = get_template_and_fix_tokenizer("skywork-chat-llama2", self.tokenizer)
         self.save_hyperparameters()
 
-        # def configure_model(self):
+    def print_example(self, example):
+        print("input_ids:\n{}".format(example["input_ids"]))
+        print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
+        print("label_ids:\n{}".format(example["labels"]))
+        print(
+            "labels:\n{}".format(
+                self.tokenizer.decode(
+                    [d if d != IGNORE_INDEX else self.tokenizer.pad_token_id for d in example["labels"]],
+                    skip_special_tokens=False,
+                )
+            )
+        )
+
+    def setup(self, stage):
+        if self.is_deepspeed_zero3_enabled:
+            from transformers.integrations import HfDeepSpeedConfig
+
+            self.ds_config = HfDeepSpeedConfig(self.trainer.strategy.config)
+
         self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
@@ -165,21 +178,6 @@ class SupervisedFintuningModule(LightningModule):
         self.model = model
         self.generation_config = model.generation_config
         self.model.print_trainable_parameters()
-
-    def print_example(self, example):
-        print("input_ids:\n{}".format(example["input_ids"]))
-        print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
-        print("label_ids:\n{}".format(example["labels"]))
-        print(
-            "labels:\n{}".format(
-                self.tokenizer.decode(
-                    [d if d != IGNORE_INDEX else self.tokenizer.pad_token_id for d in example["labels"]],
-                    skip_special_tokens=False,
-                )
-            )
-        )
-
-    def setup(self, stage):
         if self.args.dataset_name is not None:
             raw_datasets = load_dataset(
                 self.args.dataset_name,
@@ -420,7 +418,7 @@ class SupervisedFintuningModule(LightningModule):
         # ) * self.args.max_epochs
 
         t_total = self.trainer.estimated_stepping_batches
-        warmup_steps = int(self.args.warmup_proportion * t_total)
+        warmup_steps = int(self.args.warmup_ratio * t_total)
         # print(f"totla={t_total},step_batch={stepping_batches},w={warmup_steps},warm_up=={warmup_steps}")
 
         if self.args.lr_scheduler_type == "onecycle":
@@ -504,12 +502,6 @@ if __name__ == "__main__":
         "--precision",
         type=str,
         default=None,
-    )
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=str,
-        default=None,
-        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
     )
     parser.add_argument(
         "--save_steps",
@@ -703,26 +695,9 @@ if __name__ == "__main__":
     # 添加常用的checkpoint
 
     callbacks = []
-    if arg.checkpointing_steps == "epoch":
-        checkpoint = HFModelCheckpoint(
-            dirpath=arg.output_dir,
-            filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
-            save_last=True,
-            save_top_k=-1,
-            every_n_epochs=1,
-        )
-        callbacks.append(checkpoint)
-    else:
-        if arg.save_steps is not None and arg.save_total_limit is None:
-            every_n_train_steps = arg.save_steps
-            save_top_k = -1
-        elif arg.save_steps is not None and arg.save_total_limit is not None:
-            every_n_train_steps = arg.save_steps
-            save_top_k = arg.save_total_limit
-        else:
-            every_n_train_steps = None
-            save_top_k = None
-
+    if arg.save_steps is not None:
+        every_n_train_steps = arg.save_steps
+        save_top_k = arg.save_total_limit if arg.save_total_limit else -1
         checkpoint = HFModelCheckpoint(
             monitor="step",
             mode="max",
@@ -732,6 +707,17 @@ if __name__ == "__main__":
             save_top_k=save_top_k,
             save_on_train_epoch_end=True,
             save_hf=True,
+            save_last=True,
+        )
+        callbacks.append(checkpoint)
+    else:
+        # 当没有设定保存步骤的时候，使用默认epoch来保存
+        checkpoint = HFModelCheckpoint(
+            dirpath=arg.output_dir,
+            filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
+            save_last=True,
+            save_top_k=-1,
+            every_n_epochs=1,
         )
         callbacks.append(checkpoint)
 

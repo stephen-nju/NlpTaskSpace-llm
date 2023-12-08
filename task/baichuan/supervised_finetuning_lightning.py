@@ -3,6 +3,8 @@
 
 import argparse
 import functools
+import glob
+import logging
 import os
 from types import MethodType
 from typing import Any, Dict, Tuple, Union
@@ -11,8 +13,10 @@ import datasets
 import torch
 from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
-from lightning import LightningModule, Trainer, seed_everything
+from lightning import LightningModule, Trainer, _logger, seed_everything
 from lightning.pytorch.strategies import DeepSpeedStrategy, FSDPStrategy
+from lightning.pytorch.trainer.trainer import Logger
+from loguru import logger
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from rouge_chinese import Rouge
@@ -49,12 +53,11 @@ class SupervisedFintuningModule(LightningModule):
             use_fast=not args.use_slow_tokenizer,
             trust_remote_code=True,
         )
-
         self.llm_metrics = LanguageModelMetric()
         self.template = get_template_and_fix_tokenizer("baichuan2", self.tokenizer)
         self.save_hyperparameters()
 
-    def configure_model(self):
+    def setup(self, stage):
         self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
@@ -159,26 +162,85 @@ class SupervisedFintuningModule(LightningModule):
         self.generation_config = model.generation_config
         self.model.print_trainable_parameters()
 
-    def print_example(self, example):
-        print("input_ids:\n{}".format(example["input_ids"]))
-        print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
-        print("label_ids:\n{}".format(example["labels"]))
-        print(
-            "labels:\n{}".format(
-                self.tokenizer.decode(
-                    [d if d != IGNORE_INDEX else self.tokenizer.pad_token_id for d in example["labels"]],
-                    skip_special_tokens=False,
-                )
+        if self.args.dataset_name is not None:
+            raw_datasets = load_dataset(
+                self.args.dataset_name,
+                self.args.dataset_config_name,
+                streaming=self.args.streaming,
             )
-        )
+            if "validation" not in raw_datasets.keys():
+                raw_datasets["validation"] = load_dataset(
+                    self.args.dataset_name,
+                    self.args.dataset_config_name,
+                    split=f"train[:{self.args.validation_split_percentage}%]",
+                    streaming=self.args.streaming,
+                )
 
-    def setup(self, stage):
-        data_files = {}
-        data_files["train"] = [train.strip() for train in self.args.train_data.strip().split(",")]
-        data_files["validation"] = [dev.strip() for dev in self.args.dev_data.strip().split(",")]
-        self.print(f"loading datafiles ={data_files}")
+                raw_datasets["train"] = load_dataset(
+                    self.args.dataset_name,
+                    self.args.dataset_config_name,
+                    split=f"train[{self.args.validation_split_percentage}%:]",
+                    streaming=self.args.streaming,
+                )
+        else:
+            data_files = {}
+            dataset_args = {}
+            if self.args.train_data is not None:
+                train_dof = [s.strip() for s in self.args.train_data.strip().split(",")]
+            else:
+                raise ValueError("train data should not be none")
+            # direcotory_or_file
+            train_files = []
+            for dof in train_dof:
+                if os.path.exists(dof) and os.path.isfile(dof):
+                    train_files.append(dof)
+                elif os.path.exists(dof) and os.path.isdir(dof):
+                    files = (
+                        glob.glob(f"{dof}/**/*.txt", recursive=True)
+                        + glob.glob(f"{dof}/**/*.json", recursive=True)
+                        + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                    )
+                    types = [f.split(".")[-1] for f in files]
+                    if len(set(types)) > 1:
+                        raise ValueError(f"train files must be same type, e.g. all txt or all jsonl, but got {types}")
+                    train_files.extend(files)
+                else:
+                    raise ValueError("train data should be valid file path or direcotory now {dof} is valid")
 
-        raw_datasets = load_dataset("json", data_files=data_files)
+            data_files["train"] = train_files
+            if self.local_rank == 0:
+                logger.info(f">>>>train files: {train_files}")
+            if self.args.dev_data is not None:
+                dev_dof = [s.strip() for s in self.args.dev_data.split(",")]
+                dev_files = []
+                for dof in dev_dof:
+                    if os.path.exists(dof) and os.path.isfile(dof):
+                        dev_files.append(dof)
+                    elif os.path.exists(dof) and os.path.isdir(dof):
+                        files = (
+                            glob.glob(f"{dof}/**/*.txt", recursive=True)
+                            + glob.glob(f"{dof}/**/*.json", recursive=True)
+                            + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                        )
+                        types = [f.split(".")[-1] for f in files]
+                        if len(set(types)) > 1:
+                            raise ValueError(
+                                f"train files must be same type, e.g. all txt or all jsonl, but got {types}"
+                            )
+                        dev_files.extend(files)
+                    else:
+                        raise ValueError("train data should be valid file path or direcotory path split by ','")
+                if self.local_rank == 0:
+                    logger.info(f">>>>eval files: {dev_files}")
+                data_files["validation"] = dev_files
+
+            extension = "text" if data_files["train"][0].endswith("txt") else "json"
+            if extension == "text":
+                dataset_args["keep_linebreaks"] = not self.args.no_keep_linebreaks
+
+            if self.local_rank == 0:
+                logger.info(f"loading data files=>>>>{data_files}")
+            raw_datasets = load_dataset(extension, data_files=data_files)
 
         preprocessing_function_train = functools.partial(
             preprocess_supervised_dataset_train,
@@ -223,6 +285,19 @@ class SupervisedFintuningModule(LightningModule):
             remove_columns=column_names,
             load_from_cache_file=not self.args.overwrite_cache,
             desc="Running tokenizer on test dataset for testing",
+        )
+
+    def print_example(self, example):
+        logger.info("input_ids:\n{}".format(example["input_ids"]))
+        logger.info("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
+        logger.info("label_ids:\n{}".format(example["labels"]))
+        logger.info(
+            "labels:\n{}".format(
+                self.tokenizer.decode(
+                    [d if d != IGNORE_INDEX else self.tokenizer.pad_token_id for d in example["labels"]],
+                    skip_special_tokens=False,
+                )
+            )
         )
 
     @property
@@ -292,6 +367,7 @@ class SupervisedFintuningModule(LightningModule):
         output = self.model(**batch)
         self.log("lr", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, sync_dist=True)
         self.log("train_loss", output.loss, on_step=True, prog_bar=True, sync_dist=True)
+
         return output.loss
 
     def validation_step(self, batch, batch_idx):
@@ -341,7 +417,7 @@ class SupervisedFintuningModule(LightningModule):
         # ) * self.args.max_epochs
 
         t_total = self.trainer.estimated_stepping_batches
-        warmup_steps = int(self.args.warmup_proportion * t_total)
+        warmup_steps = int(self.args.warmup_ratio * t_total)
         # print(f"totla={t_total},step_batch={stepping_batches},w={warmup_steps},warm_up=={warmup_steps}")
 
         if self.args.lr_scheduler_type == "onecycle":
@@ -426,12 +502,7 @@ if __name__ == "__main__":
         type=str,
         default=None,
     )
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=str,
-        default=None,
-        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
-    )
+
     parser.add_argument(
         "--save_steps",
         type=int,
@@ -624,26 +695,9 @@ if __name__ == "__main__":
     # 添加常用的checkpoint
 
     callbacks = []
-    if arg.checkpointing_steps == "epoch":
-        checkpoint = HFModelCheckpoint(
-            dirpath=arg.output_dir,
-            filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
-            save_last=True,
-            save_top_k=-1,
-            every_n_epochs=1,
-        )
-        callbacks.append(checkpoint)
-    else:
-        if arg.save_steps is not None and arg.save_total_limit is None:
-            every_n_train_steps = arg.save_steps
-            save_top_k = -1
-        elif arg.save_steps is not None and arg.save_total_limit is not None:
-            every_n_train_steps = arg.save_steps
-            save_top_k = arg.save_total_limit
-        else:
-            every_n_train_steps = None
-            save_top_k = None
-
+    if arg.save_steps is not None:
+        every_n_train_steps = arg.save_steps
+        save_top_k = arg.save_total_limit if arg.save_total_limit else -1
         checkpoint = HFModelCheckpoint(
             monitor="step",
             mode="max",
@@ -653,6 +707,17 @@ if __name__ == "__main__":
             save_top_k=save_top_k,
             save_on_train_epoch_end=True,
             save_hf=True,
+            save_last=True,
+        )
+        callbacks.append(checkpoint)
+    else:
+        # 当没有设定保存步骤的时候，使用默认epoch来保存
+        checkpoint = HFModelCheckpoint(
+            dirpath=arg.output_dir,
+            filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
+            save_last=True,
+            save_top_k=-1,
+            every_n_epochs=1,
         )
         callbacks.append(checkpoint)
 

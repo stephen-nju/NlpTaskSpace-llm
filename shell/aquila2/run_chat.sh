@@ -8,8 +8,7 @@ MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 export TOKENIZERS_PARALLELISM=false
 export MODEL_PATH=/data/SHARE/MODELS/BAAI/AquilaChat2-34B/
 
-CUDA_VISIBLE_DEVICES=6 python task/aquila2/run_chat.py \
+CUDA_VISIBLE_DEVICES=2,3 python task/aquila2/run_chat.py \
 	--model_name_or_path=${MODEL_PATH} \
-	--lora_ckpt_path=/home/zb/saved_checkpoint/aquila2-chat-sn-v1-with-alpaca/last.ckpt/ \
-	--experiment_name=aquila-human_test_v4_plus \
-	--data_path=/home/zb/suningGit/zb/general_test_data/general_test.json
+	--experiment_name=inputs_yipinduowen_aquila_chat \
+	--data_path=/home/zb/NlpTaskSpace-llm/data/inputs.json

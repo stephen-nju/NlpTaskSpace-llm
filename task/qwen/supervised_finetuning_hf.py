@@ -5,8 +5,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import (TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple,
-                    Union)
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import jieba
 import numpy as np
@@ -16,24 +15,53 @@ import transformers
 from datasets import load_dataset
 from loguru import logger
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
-from peft import (LoraConfig, PeftModel, TaskType, get_peft_model,
-                  prepare_model_for_kbit_training)
+from peft import (
+    LoraConfig,
+    PeftModel,
+    TaskType,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+)
 from rouge_chinese import Rouge
-from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
-                          BitsAndBytesConfig, DataCollatorForSeq2Seq,
-                          HfArgumentParser, Seq2SeqTrainer,
-                          Seq2SeqTrainingArguments, set_seed)
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    DataCollatorForSeq2Seq,
+    HfArgumentParser,
+    Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
+    set_seed,
+)
 from transformers.trainer_utils import get_last_checkpoint
 
 from llm.src.constant import IGNORE_INDEX
 from llm.src.datasets.preprocessing import preprocess_supervised_dataset_train
-from llm.src.datasets.template import (get_template_and_fix_tokenizer,
-                                       register_template)
+from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
 from llm.src.utils import find_all_linear_names
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils import PreTrainedTokenizer
     from transformers.trainer import PredictionOutput
+
+
+register_template(
+    name="qwen",
+    prefix=[{"token": "<|im_start|>"}, "system\n{{system}}"],
+    prompt=[
+        {"token": "<|im_start|>"},
+        "user\n{{query}}",
+        {"token": "<|im_end|>"},
+        "\n",
+        {"token": "<|im_start|>"},
+        "assistant\n",
+    ],
+    system="You are a helpful assistant.",
+    sep=[{"token": "<|im_end|>"}, "\n"],
+    stop_words=["<|im_end|>"],
+    efficient_eos=True,
+)
 
 
 class SupervisedFinetuningTrainer(Seq2SeqTrainer):
@@ -55,24 +83,17 @@ class SupervisedFinetuningTrainer(Seq2SeqTrainer):
 
         if self.args.predict_with_generate:
             assert self.tokenizer.padding_side == "left", "This method only accepts left-padded tensor."
-
             prompt_len, label_len = inputs["input_ids"].size(-1), inputs["labels"].size(-1)
-
             if prompt_len > label_len:
                 inputs["labels"] = self._pad_tensors_to_target_len(inputs["labels"], inputs["input_ids"])
-
             if label_len > prompt_len:  # truncate the labels instead of padding the inputs (llama2 fp16 compatibility)
                 inputs["labels"] = inputs["labels"][:, :prompt_len]
-
         loss, generated_tokens, _ = super().prediction_step(  # ignore the returned labels (may be truncated)
             model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
         )
-
         if generated_tokens is not None and self.args.predict_with_generate:
             generated_tokens[:, :prompt_len] = self.tokenizer.pad_token_id
-
             generated_tokens = generated_tokens.contiguous()
-
         return loss, generated_tokens, labels
 
     def _pad_tensors_to_target_len(self, src_tensor: torch.Tensor, tgt_tensor: torch.Tensor) -> torch.Tensor:
@@ -83,11 +104,8 @@ class SupervisedFinetuningTrainer(Seq2SeqTrainer):
         """
 
         assert self.tokenizer.pad_token_id is not None, "Pad token is required."
-
         padded_tensor = self.tokenizer.pad_token_id * torch.ones_like(tgt_tensor)
-
         padded_tensor[:, -src_tensor.shape[-1] :] = src_tensor  # adopt left-padding
-
         return padded_tensor.contiguous()  # in contiguous memory
 
     def save_predictions(self, predict_results: "PredictionOutput") -> None:
@@ -474,7 +492,7 @@ def main():
                 raise ValueError(f"train files must be same type, e.g. all txt or all jsonl, but got {types}")
             train_files.extend(files)
         else:
-            raise ValueError("train data should be valid file path or direcotory path split by ','")
+            raise ValueError(f"train data should be valid file path or direcotory {dof}")
     data_files["train"] = train_files
 
     if finetune_args.dev_data is not None:

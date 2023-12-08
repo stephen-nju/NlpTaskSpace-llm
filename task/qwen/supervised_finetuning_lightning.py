@@ -3,6 +3,8 @@
 
 import argparse
 import functools
+import glob
+import json
 import os
 from types import MethodType
 from typing import Any, Dict, Tuple, Union
@@ -13,6 +15,7 @@ from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning import LightningModule, Trainer, seed_everything
 from lightning.pytorch.strategies import DeepSpeedStrategy, FSDPStrategy
+from loguru import logger
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from rouge_chinese import Rouge
@@ -67,12 +70,134 @@ class SupervisedFintuningModule(LightningModule):
             use_fast=not args.use_slow_tokenizer,
             trust_remote_code=True,
         )
-
         self.llm_metrics = LanguageModelMetric()
         self.template = get_template_and_fix_tokenizer("qwen", self.tokenizer)
         self.save_hyperparameters()
 
-        # def configure_model(self):
+    # def configure_model(self):
+    #     self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
+    #     if self.args.quantization_bit is not None:
+    #         print(f"Quantized to {self.args.quantization_bit}")
+    #         if self.is_deepspeed_zero3_enabled:
+    #             raise ValueError("DeepSpeed ZeRO-3 is incompatible with quantization.")
+    #         if self.args.quantization_bit == "4bit":
+    #             # load_in_4bit = (True,)
+    #             quantization_config = BitsAndBytesConfig(
+    #                 bnb_4bit_compute_dtype=torch.bfloat16,
+    #                 bnb_4bit_use_double_quant=True,
+    #                 bnb_4bit_quant_type="nf4",
+    #             )
+    #         elif self.args.quantization_bit == "8bit":
+    #             quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    #         else:
+    #             raise ValueError("unsupport quantization_bit")
+
+    #         model = AutoModelForCausalLM.from_pretrained(
+    #             self.args.model_name_or_path,
+    #             from_tf=bool(".ckpt" in self.args.model_name_or_path),
+    #             config=self.config,
+    #             quantization_config=quantization_config,
+    #             low_cpu_mem_usage=True,
+    #             trust_remote_code=True,
+    #         )
+
+    #     else:
+    #         # 使用bf16 来加载模型
+    #         print(f"model config===\n{self.config}")
+    #         model = AutoModelForCausalLM.from_pretrained(
+    #             self.args.model_name_or_path,
+    #             from_tf=bool(".ckpt" in self.args.model_name_or_path),
+    #             config=self.config,
+    #             trust_remote_code=True,
+    #             torch_dtype="auto",
+    #         )
+    #     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
+    #     # on a small vocab and want a smaller embedding size, remove this test.
+
+    #     # embedding_size = model.get_input_embeddings().weight.shape[0]
+    #     # if len(tokenizer) > embedding_size:
+    #     #     model.resize_token_embeddings(len(tokenizer))
+
+    #     # model.supports_gradient_checkpointing = True  #
+    #     model.gradient_checkpointing_enable()
+    #     model.enable_input_require_grads()
+
+    #     model.config.use_cache = False  # silence the warnings. Please re-enable for inference!the datasets
+
+    #     # 分布式训练
+    #     model.is_parallelizable = True
+    #     model.model_parallel = True
+
+    #     if self.args.quantization_bit is not None:
+    #         # 启用模型量化需要开启
+    #         model = prepare_model_for_kbit_training(model)
+
+    #     # Set NEFTune trick for fine-tuning
+    #     if self.args.neft_alpha > 0:
+    #         input_embed = model.get_input_embeddings()
+    #         if isinstance(input_embed, torch.nn.Embedding):
+
+    #             def noisy_forward(self: torch.nn.Embedding, x: torch.Tensor) -> torch.Tensor:
+    #                 embeddings = input_embed.__class__.forward(self, x)
+    #                 dims = self.num_embeddings * self.embedding_dim
+    #                 mag_norm = self.args.neft_alpha / (dims**0.5)
+    #                 embeddings += torch.zeros_like(embeddings).uniform_(-mag_norm, mag_norm)
+    #                 return embeddings
+
+    #             # 将方法绑定到forward上,参考medicalGPT
+    #             input_embed.forward = MethodType(noisy_forward, input_embed)
+    #             self.log("Using noisy embedding with alpha={:.2f}".format(self.args.neft_alpha))
+    #         else:
+    #             self.log("Input embeddings are not normal nn.Embedding, cannot transform into noisy embedding.")
+
+    #     if self.args.use_lora:
+    #         if isinstance(self.args.lora_target, str):
+    #             if self.args.lora_target == "all":
+    #                 lora_target = find_all_linear_names(model, self.args.quantization_bit)
+    #             else:
+    #                 # support custom target modules/layers of LoRA
+    #                 lora_target = [target.strip() for target in self.args.lora_target.split(",")]
+    #         ### TODO 添加全量lora 的微调
+    #         peft_config = LoraConfig(
+    #             task_type=TaskType.CAUSAL_LM,
+    #             target_modules=lora_target,
+    #             inference_mode=False,
+    #             r=self.args.lora_rank,
+    #             lora_alpha=self.args.lora_alpha,
+    #             lora_dropout=self.args.lora_dropout,
+    #         )
+    #         # adalora 会出现 https://github.com/huggingface/peft/issues/479
+
+    #         model = get_peft_model(model, peft_config)
+
+    #         # 分布式训练
+    #         model.is_parallelizable = True
+    #         model.model_parallel = True
+    #         model.print_trainable_parameters()
+
+    # self.model = model
+    # self.generation_config = model.generation_config
+    # self.model.print_trainable_parameters()
+
+    def print_example(self, example):
+        print("input_ids:\n{}".format(example["input_ids"]))
+        print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
+        print("label_ids:\n{}".format(example["labels"]))
+        print(
+            "labels:\n{}".format(
+                self.tokenizer.decode(
+                    [d if d != IGNORE_INDEX else self.tokenizer.pad_token_id for d in example["labels"]],
+                    skip_special_tokens=False,
+                )
+            )
+        )
+
+    def setup(self, stage):
+        if self.is_deepspeed_zero3_enabled:
+            from transformers.integrations import HfDeepSpeedConfig
+
+            self.ds_config = HfDeepSpeedConfig(self.trainer.strategy.config)
+
         self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
@@ -176,27 +301,87 @@ class SupervisedFintuningModule(LightningModule):
         self.model = model
         self.generation_config = model.generation_config
         self.model.print_trainable_parameters()
-
-    def print_example(self, example):
-        print("input_ids:\n{}".format(example["input_ids"]))
-        print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
-        print("label_ids:\n{}".format(example["labels"]))
-        print(
-            "labels:\n{}".format(
-                self.tokenizer.decode(
-                    [d if d != IGNORE_INDEX else self.tokenizer.pad_token_id for d in example["labels"]],
-                    skip_special_tokens=False,
-                )
+        logger.info(self.trainer.strategy.config)
+        if self.args.dataset_name is not None:
+            raw_datasets = load_dataset(
+                self.args.dataset_name,
+                self.args.dataset_config_name,
+                streaming=self.args.streaming,
             )
-        )
+            if "validation" not in raw_datasets.keys():
+                raw_datasets["validation"] = load_dataset(
+                    self.args.dataset_name,
+                    self.args.dataset_config_name,
+                    split=f"train[:{self.args.validation_split_percentage}%]",
+                    streaming=self.args.streaming,
+                )
 
-    def setup(self, stage):
-        data_files = {}
-        data_files["train"] = [train.strip() for train in self.args.train_data.strip().split(",")]
-        data_files["validation"] = [dev.strip() for dev in self.args.dev_data.strip().split(",")]
-        self.print(f"loading datafiles ={data_files}")
+                raw_datasets["train"] = load_dataset(
+                    self.args.dataset_name,
+                    self.args.dataset_config_name,
+                    split=f"train[{self.args.validation_split_percentage}%:]",
+                    streaming=self.args.streaming,
+                )
+        else:
+            data_files = {}
+            dataset_args = {}
+            if self.args.train_data is not None:
+                train_dof = [s.strip() for s in self.args.train_data.strip().split(",")]
+            else:
+                raise ValueError("train data should not be none")
+            # direcotory_or_file
+            train_files = []
+            for dof in train_dof:
+                if os.path.exists(dof) and os.path.isfile(dof):
+                    train_files.append(dof)
+                elif os.path.exists(dof) and os.path.isdir(dof):
+                    files = (
+                        glob.glob(f"{dof}/**/*.txt", recursive=True)
+                        + glob.glob(f"{dof}/**/*.json", recursive=True)
+                        + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                    )
+                    types = [f.split(".")[-1] for f in files]
+                    if len(set(types)) > 1:
+                        raise ValueError(f"train files must be same type, e.g. all txt or all jsonl, but got {types}")
+                    train_files.extend(files)
+                else:
+                    raise ValueError("train data should be valid file path or direcotory now {dof} is valid")
 
-        raw_datasets = load_dataset("json", data_files=data_files)
+            data_files["train"] = train_files
+            if self.local_rank == 0:
+                logger.info(f">>>>train files: {train_files}")
+            if self.args.dev_data is not None:
+                dev_dof = [s.strip() for s in self.args.dev_data.split(",")]
+                dev_files = []
+                for dof in dev_dof:
+                    if os.path.exists(dof) and os.path.isfile(dof):
+                        dev_files.append(dof)
+                    elif os.path.exists(dof) and os.path.isdir(dof):
+                        files = (
+                            glob.glob(f"{dof}/**/*.txt", recursive=True)
+                            + glob.glob(f"{dof}/**/*.json", recursive=True)
+                            + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                        )
+                        types = [f.split(".")[-1] for f in files]
+                        if len(set(types)) > 1:
+                            raise ValueError(
+                                f"train files must be same type, e.g. all txt or all jsonl, but got {types}"
+                            )
+                        dev_files.extend(files)
+                    else:
+                        raise ValueError("train data should be valid file path or direcotory path split by ','")
+                if self.local_rank == 0:
+                    logger.info(f">>>>eval files: {dev_files}")
+                data_files["validation"] = dev_files
+
+            extension = "text" if data_files["train"][0].endswith("txt") else "json"
+            if extension == "text":
+                dataset_args["keep_linebreaks"] = not self.args.no_keep_linebreaks
+
+            if self.local_rank == 0:
+                logger.info(f"loading data files=>>>>{data_files}")
+            raw_datasets = load_dataset(extension, data_files=data_files)
+
         preprocessing_function_train = functools.partial(
             preprocess_packed_supervised_dataset_train
             if self.args.sft_packing
@@ -206,6 +391,7 @@ class SupervisedFintuningModule(LightningModule):
             max_source_length=self.args.max_source_length,
             max_target_length=self.args.max_target_length,
         )
+
         column_names = raw_datasets["train"].column_names
         self.train_dataset = raw_datasets["train"].map(
             preprocessing_function_train,
@@ -339,17 +525,17 @@ class SupervisedFintuningModule(LightningModule):
 
     def configure_optimizers(self):
         no_decay = ["bias", "LayerNorm.weight"]
-        params_decay = [p for n, p in self.named_parameters() if not any(nd in n for nd in no_decay)]
-        params_nodecay = [p for n, p in self.named_parameters() if any(nd in n for nd in no_decay)]
+        params_decay = [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)]
+        params_nodecay = [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)]
 
         optim_groups = [
             {"params": params_decay, "weight_decay": self.args.weight_decay},
             {"params": params_nodecay, "weight_decay": 0.0},
         ]
-
         if self.deepspeed_offload:
             optimizer = DeepSpeedCPUAdam(optim_groups, lr=self.args.learning_rate, eps=self.arsg.adam_epsilon)
-
+        # from deepspeed.ops.adam import FusedAdam
+        # optimizer = FusedAdam(optim_groups, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
         optimizer = torch.optim.AdamW(optim_groups, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
         # num_gpus = self.trainer.num_devices
         # # 注：只有在使用pytorch Lightning的LightningDataModule 时候才可以使用该方式回去训练集大小
@@ -358,9 +544,8 @@ class SupervisedFintuningModule(LightningModule):
         # t_total = (
         #     len(self.train_dataloader()) // (self.trainer.accumulate_grad_batches * num_gpus) + 1
         # ) * self.args.max_epochs
-
         t_total = self.trainer.estimated_stepping_batches
-        warmup_steps = int(self.args.warmup_proportion * t_total)
+        warmup_steps = int(self.args.warmup_ratio * t_total)
         # print(f"totla={t_total},step_batch={stepping_batches},w={warmup_steps},warm_up=={warmup_steps}")
 
         if self.args.lr_scheduler_type == "onecycle":
@@ -391,6 +576,7 @@ class SupervisedFintuningModule(LightningModule):
 
         else:
             raise ValueError("lr_scheduler does not exist.")
+
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
 
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
@@ -407,10 +593,32 @@ if __name__ == "__main__":
         default="./output_dir/",
         help="path to save model and checkpoint .it is the root dir",
     )
+    parser.add_argument("--train_data", type=str, default=None, help="the input train file or train data directory")
+    parser.add_argument("--test_data", type=str, default=None, help="test data path")
+    parser.add_argument("--dev_data", type=str, default=None, help="dev data path")
+    parser.add_argument(
+        "--dataset_name", type=str, default=None, help="The name of the dataset to use (via the datasets library)."
+    )
+    parser.add_argument(
+        "--dataset_config_name",
+        type=str,
+        default=None,
+        help="The configuration name of the dataset to use (via the datasets library).",
+    )
+    parser.add_argument(
+        "--max_train_samples", type=int, default=None, help="truncate the number of training examples to this"
+    )
+    parser.add_argument(
+        "--max_eval_samples", type=int, default=None, help=" truncate the number of evaluation examples to this"
+    )
 
-    parser.add_argument("--train_data", type=str, default="", help="the input train file or train data directory")
-    parser.add_argument("--test_data", type=str, default="", help="test data path")
-    parser.add_argument("--dev_data", type=str, default="", help="dev data path")
+    parser.add_argument("--streaming", action="store_true", help="Enable streaming mode")
+    parser.add_argument(
+        "--validation_split_percentage",
+        type=int,
+        default=1,
+        help="The percentage of the train set used as validation set in case there's no validation split",
+    )
     parser.add_argument(
         "--model_name_or_path",
         type=str,
@@ -423,11 +631,13 @@ if __name__ == "__main__":
         type=str,
         default=None,
     )
+
     parser.add_argument(
         "--save_steps",
         type=int,
         default=500,
     )
+    parser.add_argument("--save_total_limit", type=int, default=None, help="save total limit")
 
     parser.add_argument(
         "--lr_scheduler_type",
@@ -443,7 +653,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--workers", type=int, default=0, help="num workers for dataloader")
     parser.add_argument(
-        "--warmup_proportion",
+        "--warmup_ratio",
         default=0.1,
         type=float,
         help="warmup steps used for scheduler.",
@@ -533,12 +743,6 @@ if __name__ == "__main__":
         help="Do not keep line breaks when using TXT files.",
     )
     parser.add_argument(
-        "--checkpointing_steps",
-        type=str,
-        default=None,
-        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
-    )
-    parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
         default=None,
@@ -583,12 +787,11 @@ if __name__ == "__main__":
         help="quantization training like 4bit 8bit",
     )
     parser.add_argument("--use_lora", type=bool, default=True, help="using lora")
-
     parser.add_argument("--lora_rank", type=int, default=8, help="The intrinsic dimension for LoRA fine-tuning.")
     parser.add_argument(
         "--lora_alpha",
         type=float,
-        default=32,
+        default=None,
         help="The scale factor for LoRA fine-tuning (similar with the learning rate)",
     )
     parser.add_argument("--lora_dropout", type=float, default=0.1, help="")
@@ -605,40 +808,53 @@ if __name__ == "__main__":
         "--sft_packing", action="store_true", help="packing multi round qa in supervised  fintuning stage"
     )
     arg = parser.parse_args()
-    # 检查会冲突的参数
-    if arg.deepspeed and arg.fsdp:
-        # 训练策略智能选一个
-        raise ValueError("Either --deepspeed or --fsdp has to be provided")
 
     if arg.seed is not None:
         seed_everything(arg.seed)
+
     # 先加载模型，再加载数据
     model = SupervisedFintuningModule(arg)
 
     if arg.deepspeed:
         strategy = DeepSpeedStrategy(config=arg.deepspeed)
+
     elif arg.fsdp:
         strategy = FSDPStrategy()
     else:
         strategy = "auto"
-
     # 添加常用的checkpoint
+
     callbacks = []
-    checkpoint = HFModelCheckpoint(
-        monitor="train_loss",
-        dirpath=arg.output_dir,
-        every_n_train_steps=arg.save_steps,
-        filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
-        save_last=True,
-        save_hf=True,
-    )
-    callbacks.append(checkpoint)
+    if arg.save_steps is not None:
+        every_n_train_steps = arg.save_steps
+        save_top_k = arg.save_total_limit if arg.save_total_limit else -1
+        checkpoint = HFModelCheckpoint(
+            monitor="step",
+            mode="max",
+            dirpath=arg.output_dir,
+            filename="sn-generate-{step:02d}-{train_loss:.2f}",
+            every_n_train_steps=every_n_train_steps,
+            save_top_k=save_top_k,
+            save_on_train_epoch_end=True,
+            save_hf=True,
+            save_last=True,
+        )
+        callbacks.append(checkpoint)
+    else:
+        # 当没有设定保存步骤的时候，使用默认epoch来保存
+        checkpoint = HFModelCheckpoint(
+            dirpath=arg.output_dir,
+            filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
+            save_last=True,
+            save_top_k=-1,
+            every_n_epochs=1,
+        )
+        callbacks.append(checkpoint)
 
     trainer = Trainer(
         devices="auto",
         max_epochs=arg.max_epochs,
         strategy=strategy,
-        max_steps=arg.max_steps,
         callbacks=callbacks,
         log_every_n_steps=1,
         num_sanity_val_steps=0,
@@ -646,5 +862,4 @@ if __name__ == "__main__":
         accumulate_grad_batches=arg.gradient_accumulation_steps,
     )
     trainer.fit(model)
-
     trainer.test(model)
