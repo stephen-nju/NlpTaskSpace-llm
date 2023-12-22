@@ -41,7 +41,7 @@ export DEV_DATA="/home/zb/suningGit/zb/train_data/v1/sn_generate_gpt_v1_dev.json
 
 # source /root/venv/lightning/bin/activate
 # # 激活虚拟环境
-deepspeed --include=localhost:0,1 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/qwen/supervised_finetuning_lightning.py \
+deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/qwen/supervised_finetuning_lightning.py \
 	--deepspeed ${DS_CONFIG_STAGE_3} \
 	--overwrite_cache \
 	--model_name_or_path ${MODEL_PATH} \

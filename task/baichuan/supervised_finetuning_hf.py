@@ -5,8 +5,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import (TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple,
-                    Union)
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import jieba
 import numpy as np
@@ -16,19 +15,30 @@ import transformers
 from datasets import load_dataset
 from loguru import logger
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
-from peft import (LoraConfig, PeftModel, TaskType, get_peft_model,
-                  prepare_model_for_kbit_training)
+from peft import (
+    LoraConfig,
+    PeftModel,
+    TaskType,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+)
 from rouge_chinese import Rouge
-from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
-                          BitsAndBytesConfig, DataCollatorForSeq2Seq,
-                          HfArgumentParser, Seq2SeqTrainer,
-                          Seq2SeqTrainingArguments, set_seed)
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    DataCollatorForSeq2Seq,
+    HfArgumentParser,
+    Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
+    set_seed,
+)
 from transformers.trainer_utils import get_last_checkpoint
 
 from llm.src.constant import IGNORE_INDEX
 from llm.src.datasets.preprocessing import preprocess_supervised_dataset_train
-from llm.src.datasets.template import (get_template_and_fix_tokenizer,
-                                       register_template)
+from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
 from llm.src.utils import find_all_linear_names
 
 if TYPE_CHECKING:

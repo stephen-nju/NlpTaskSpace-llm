@@ -66,6 +66,12 @@ class SupervisedFintuningModule(LightningModule):
         self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
 
     def setup(self, stage):
+        if self.is_deepspeed_zero3_enabled:
+            from transformers.integrations import HfDeepSpeedConfig
+
+            self.ds_config = HfDeepSpeedConfig(self.trainer.strategy.config)
+
+        self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
         if self.args.quantization_bit is not None:
             print(f"Quantized to {self.args.quantization_bit}")
             if self.is_deepspeed_zero3_enabled:
@@ -103,18 +109,39 @@ class SupervisedFintuningModule(LightningModule):
             )
         # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
         # on a small vocab and want a smaller embedding size, remove this test.
+        # if not isinstance(model.get_output_embeddings(), torch.nn.Linear):
+        #     logger.warning("Current model does not support resizing token embeddings.")
 
-        # embedding_size = model.get_input_embeddings().weight.shape[0]
-        # if len(tokenizer) > embedding_size:
-        #     model.resize_token_embeddings(len(tokenizer))
+        if self.is_deepspeed_zero3_enabled:
+            import deepspeed
 
+            input_embedding = model.get_input_embeddings().weight
+            with deepspeed.zero.GatheredParameters(input_embedding, modifier_rank=None):
+                embedding_size = input_embedding.size(0)
+        else:
+            embedding_size = model.get_input_embeddings().weight.size(0)
+
+        logger.info(f"Model embedding size is {embedding_size}")
+        if len(self.tokenizer) != embedding_size:
+            # padding一下
+            model.resize_token_embeddings(len(self.tokenizer), pad_to_multiple_of=64)
+            new_vocab_size = model.get_input_embeddings().weight.size(0)
+            logger.info("Resized token embeddings from {} to {}.".format(embedding_size, new_vocab_size))
         # model.supports_gradient_checkpointing = True  #
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
+        if getattr(model, "supports_gradient_checkpointing", False):
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+            else:
 
-        model.config.use_cache = False  # silence the warnings. Please re-enable for inference!the datasets
+                def make_inputs_require_grad(module: torch.nn.Module, args: Tuple[torch.Tensor], output: torch.Tensor):
+                    output.requires_grad_(True)
 
-        # 分布式训练
+                model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+            model.gradient_checkpointing_enable()
+            model.config.use_cache = False  # silence the warnings. Please re-enable for inference!the datasets
+            logger.info("Gradient checkpointing enabled.")
+
         model.is_parallelizable = True
         model.model_parallel = True
 
@@ -141,16 +168,38 @@ class SupervisedFintuningModule(LightningModule):
                 self.log("Input embeddings are not normal nn.Embedding, cannot transform into noisy embedding.")
 
         if self.args.use_lora:
+            # 使用lora的时候，设置输出层的精度
+            output_layer_name = "lm_head"
+            if hasattr(model, output_layer_name):
+                output_layer = getattr(model, output_layer_name)
+                if isinstance(output_layer, torch.nn.Linear):
+
+                    def fp32_forward_pre_hook(module: torch.nn.Module, args: Tuple[torch.Tensor]):
+                        return args[0].to(output_layer.weight.dtype)
+
+                    def fp32_forward_post_hook(
+                        module: torch.nn.Module, args: Tuple[torch.Tensor], output: torch.Tensor
+                    ):
+                        return output.to(torch.float32)
+
+                    output_layer.register_forward_pre_hook(fp32_forward_pre_hook)
+                    output_layer.register_forward_hook(fp32_forward_post_hook)
+
             if isinstance(self.args.lora_target, str):
                 if self.args.lora_target == "all":
                     lora_target = find_all_linear_names(model, self.args.quantization_bit)
                 else:
                     # support custom target modules/layers of LoRA
                     lora_target = [target.strip() for target in self.args.lora_target.split(",")]
-            ### TODO 添加全量lora 的微调
+
+            modules_to_save = self.args.lora_modules_to_save
+            if self.args.lora_modules_to_save is not None:
+                modules_to_save = [t.strip() for t in self.args.lora_modules_to_save.split(",")]
+
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 target_modules=lora_target,
+                modules_to_save=modules_to_save,
                 inference_mode=False,
                 r=self.args.lora_rank,
                 lora_alpha=self.args.lora_alpha,
@@ -159,6 +208,14 @@ class SupervisedFintuningModule(LightningModule):
             # adalora 会出现 https://github.com/huggingface/peft/issues/479
 
             model = get_peft_model(model, peft_config)
+            if self.args.upcast_layernorm:
+                # cast the layernore to fp32
+                # layer norm 计算精度的设定
+                layernorm_names = {"norm", "ln"}
+                for name, param in model.named_parameters():
+                    if param.ndim == 1 and any(ln_name in name for ln_name in layernorm_names):
+                        param.data = param.data.to(torch.float32)
+                logger.info("Upcasting weights in layernorm in float32.")
 
             # 分布式训练
             model.is_parallelizable = True
@@ -168,6 +225,8 @@ class SupervisedFintuningModule(LightningModule):
         self.model = model
         self.generation_config = model.generation_config
         self.model.print_trainable_parameters()
+
+        logger.info(self.trainer.strategy.config)
         if self.args.dataset_name is not None:
             raw_datasets = load_dataset(
                 self.args.dataset_name,
@@ -511,12 +570,7 @@ if __name__ == "__main__":
         type=str,
         default=None,
     )
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=str,
-        default=None,
-        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
-    )
+
     parser.add_argument(
         "--save_steps",
         type=int,
@@ -687,6 +741,19 @@ if __name__ == "__main__":
         help="lora target name",
     )
     parser.add_argument("--lora_ckpt_path", type=str, default=None, help="")
+    parser.add_argument(
+        "--lora_modules_to_save",
+        type=list,
+        default=None,
+        help="List of modules apart from LoRA layers to be set as trainable and saved in the final checkpoint ",
+    )
+
+    parser.add_argument(
+        "--upcast_layernorm",
+        type=bool,
+        default=False,
+        help="up cast layernorm to fp32",
+    )
     parser.add_argument("--max_steps", type=int, default=-1, help="max train steps")
     parser.add_argument("--fsdp", action="store_true", help="using fsdp strategy for training")
     parser.add_argument(
@@ -709,26 +776,9 @@ if __name__ == "__main__":
     # 添加常用的checkpoint
 
     callbacks = []
-    if arg.checkpointing_steps == "epoch":
-        checkpoint = HFModelCheckpoint(
-            dirpath=arg.output_dir,
-            filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
-            save_last=True,
-            save_top_k=-1,
-            every_n_epochs=1,
-        )
-        callbacks.append(checkpoint)
-    else:
-        if arg.save_steps is not None and arg.save_total_limit is None:
-            every_n_train_steps = arg.save_steps
-            save_top_k = -1
-        elif arg.save_steps is not None and arg.save_total_limit is not None:
-            every_n_train_steps = arg.save_steps
-            save_top_k = arg.save_total_limit
-        else:
-            every_n_train_steps = None
-            save_top_k = None
-
+    if arg.save_steps is not None:
+        every_n_train_steps = arg.save_steps
+        save_top_k = arg.save_total_limit if arg.save_total_limit else -1
         checkpoint = HFModelCheckpoint(
             monitor="step",
             mode="max",
@@ -738,6 +788,17 @@ if __name__ == "__main__":
             save_top_k=save_top_k,
             save_on_train_epoch_end=True,
             save_hf=True,
+            save_last=True,
+        )
+        callbacks.append(checkpoint)
+    else:
+        # 当没有设定保存步骤的时候，使用默认epoch来保存
+        checkpoint = HFModelCheckpoint(
+            dirpath=arg.output_dir,
+            filename="sn-generate-{epoch:02d}-{train_loss:.2f}",
+            save_last=True,
+            save_top_k=-1,
+            every_n_epochs=1,
         )
         callbacks.append(checkpoint)
 

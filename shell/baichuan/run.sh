@@ -24,12 +24,12 @@ MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 # torch 版本为2.0.1 过高的版本训练可能出问题
 source /root/venv/lightning/bin/activate
 # 激活虚拟环境
-deepspeed --include=localhost:4,5 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/baichuan/supervised_finetuning_lightning.py \
-	--deepspeed ${LIGHTNING_DS_CONFIG_STAGE_2} \
+deepspeed --include=localhost:6,7 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/baichuan/supervised_finetuning_lightning.py \
+	--deepspeed ${LIGHTNING_DS_CONFIG_STAGE_3} \
 	--overwrite_cache \
-	--model_name_or_path /home/zb/saved_checkpoint/light_baichuan_base_pt_lr1e4_2epoch/merge/ \
-	--output_dir /home/zb/saved_checkpoint/light_baichuan_pt_v2_sft_sn_v5_tiger_lr2e4_1epoch \
-	--train_data /home/zb/suningGit/zb/train_data/v5/train/,/home/zb/suningGit/zb/train_data/tigerbot_sft_zh \
+	--model_name_or_path ${BAICHUAN2_13B} \
+	--output_dir /home/zb/saved_checkpoint/light_baichuan_test \
+	--train_data /home/zb/suningGit/zb/train_data/v5/train/ \
 	--dev_data /home/zb/suningGit/zb/train_data/v5/dev/ \
 	--max_epochs 1 \
 	--max_source_length 1024 \
