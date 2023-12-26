@@ -211,8 +211,9 @@ def register_template(
 
 def get_template_and_fix_tokenizer(name: str, tokenizer: "PreTrainedTokenizer") -> Template:
     if tokenizer.eos_token_id is None:
+        # if isinstance(getattr(tokenizer,"tokenizer",None),tiktoken.Encoding):
+        #     tokenizer.eos_token_id=tokenizer.eod_id
         tokenizer.eos_token = "<|endoftext|>"
-
         logger.info("Add eos token: {}".format(tokenizer.eos_token))
 
     if tokenizer.pad_token_id is None:

@@ -4,19 +4,26 @@ import csv
 import json
 import os
 import warnings
-from typing import (TYPE_CHECKING, Any, Callable, Generator, List, Optional,
-                    Tuple, Union)
+from typing import TYPE_CHECKING, Any, Callable, Generator, List, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
 from peft import PeftModel
-from qwen_generation_utils import (HistoryType, StopWordsLogitsProcessor,
-                                   decode_tokens, get_stop_words_ids,
-                                   make_context)
+from qwen_generation_utils import (
+    HistoryType,
+    StopWordsLogitsProcessor,
+    decode_tokens,
+    get_stop_words_ids,
+    make_context,
+)
 from tqdm import tqdm
-from transformers import (AutoModelForCausalLM, AutoTokenizer,
-                          GenerationConfig, PreTrainedTokenizer,
-                          StoppingCriteriaList)
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GenerationConfig,
+    PreTrainedTokenizer,
+    StoppingCriteriaList,
+)
 
 try:
     from einops import rearrange
