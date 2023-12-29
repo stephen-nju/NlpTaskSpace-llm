@@ -21,7 +21,13 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from loguru import logger
-from peft import LoraConfig, PeftModel, TaskType, get_peft_model, prepare_model_for_kbit_training
+from peft import (
+    LoraConfig,
+    PeftModel,
+    TaskType,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+)
 from sklearn.metrics import accuracy_score
 from transformers import (
     AutoConfig,
@@ -150,9 +156,9 @@ class DataArguments:
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
 
-    train_file_dir: Optional[str] = field(default=None, metadata={"help": "The train text data file folder."})
+    train_data: Optional[str] = field(default=None, metadata={"help": "The train text data file folder."})
 
-    validation_file_dir: Optional[str] = field(
+    dev_data: Optional[str] = field(
         default=None,
         metadata={"help": "An optional input evaluation data file to evaluate the perplexity on text file folder."},
     )

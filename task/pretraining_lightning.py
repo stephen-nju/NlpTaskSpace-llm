@@ -15,7 +15,6 @@ import torch
 from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning import LightningModule, Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.strategies import DeepSpeedStrategy, FSDPStrategy
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from torch.utils.data import DataLoader, Dataset
@@ -24,7 +23,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    default_data_collator,
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup,
