@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from glob import glob
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
-import tiktoken
 import torch
 from datasets import load_dataset
 from loguru import logger
@@ -16,10 +15,9 @@ from peft import (
     PeftModel,
     TaskType,
     get_peft_model,
-    prepare_model_for_int8_training,
+    prepare_model_for_kbit_training,
 )
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from torch.utils.data import Dataset
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
@@ -30,7 +28,6 @@ from transformers import (
     HfArgumentParser,
     LlamaForSequenceClassification,
     LlamaTokenizer,
-    PreTrainedTokenizerBase,
     Trainer,
     TrainingArguments,
     set_seed,
@@ -39,11 +36,10 @@ from transformers.trainer import TRAINING_ARGS_NAME
 
 from llm.src.datasets.preprocessing import preprocess_reward_function
 from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
-from llm.src.utils import print_trainable_parameters
+from llm.src.utils import find_all_linear_names, print_trainable_parameters
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
-
 
 register_template(
     name="qwen",
@@ -62,7 +58,6 @@ register_template(
     efficient_eos=True,
 )
 
-
 MODEL_CLASSES = {
     "bloom": (AutoConfig, BloomForSequenceClassification, BloomTokenizerFast),
     "llama": (AutoConfig, LlamaForSequenceClassification, LlamaTokenizer),
@@ -72,14 +67,9 @@ MODEL_CLASSES = {
 
 @dataclass
 class ModelArguments:
-    """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
-    """
-
     model_type: str = field(
         default=None, metadata={"help": "Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys())}
     )
-
     model_name_or_path: Optional[str] = field(
         default=None,
         metadata={
@@ -88,18 +78,15 @@ class ModelArguments:
             )
         },
     )
-
     tokenizer_name_or_path: Optional[str] = field(
         default=None,
         metadata={
             "help": ("The tokenizer for weights initialization.Don't set if you want to train a model from scratch.")
         },
     )
-
-    load_in_4bit: bool = field(default=False, metadata={"help": "Whether to load the model in 4bit mode or not."})
-
-    load_in_8bit: bool = field(default=False, metadata={"help": "Whether to load the model in 8bit mode or not."})
-
+    quantization_bit: Optional[str] = field(
+        default=None, metadata={"help": ("quantization bit"), "choices": ["4bit", "8bit"]}
+    )
     cache_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
@@ -195,9 +182,9 @@ class DataArguments:
 
 
 @dataclass
-class ScriptArguments:
+class FinetuneArguments:
     use_peft: bool = field(default=True, metadata={"help": "Whether to use peft"})
-    target_modules: Optional[str] = field(default="all")
+    lora_target: Optional[str] = field(default="all")
     lora_rank: Optional[int] = field(default=8)
     lora_dropout: Optional[float] = field(default=0.05)
     lora_alpha: Optional[float] = field(default=32.0)
@@ -291,113 +278,52 @@ class RewardTrainer(Trainer):
 
         return loss
 
-    def evaluate(
-        self,
-        eval_dataset: Optional[Dataset] = None,
-        ignore_keys: Optional[List[str]] = None,
-        metric_key_prefix: str = "eval",
-    ) -> Dict[str, float]:
-        if eval_dataset is None:
-            eval_dataset = self.eval_dataset
-
-        return super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
-
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        # Prepare inputs for chosen and rejected separately
-
-        device = model.device
-
-        inputs_chosen = {
-            "input_ids": inputs["input_ids_chosen"].to(device),
-            "attention_mask": inputs["attention_mask_chosen"].to(device),
-        }
-
-        outputs_chosen = model(**inputs_chosen)
-
-        rewards_chosen = outputs_chosen.logits.detach()
-
-        inputs_rejected = {
-            "input_ids": inputs["input_ids_rejected"].to(device),
-            "attention_mask": inputs["attention_mask_rejected"].to(device),
-        }
-
-        outputs_rejected = model(**inputs_rejected)
-
-        rewards_rejected = outputs_rejected.logits.detach()
-
-        # Keep the compute_loss method
-
-        loss = -torch.nn.functional.logsigmoid(rewards_chosen - rewards_rejected).mean()
-
-        if prediction_loss_only:
-            return (loss, None, None)
-
-        return (loss, rewards_chosen, rewards_rejected)
-
     def save_model(self, output_dir=None, _internal_call=False):
         """Save the LoRA model."""
-
         os.makedirs(output_dir, exist_ok=True)
-
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
-
         self.model.save_pretrained(output_dir)
 
 
 def save_model(model, tokenizer, args):
     """Save the model and the tokenizer."""
-
     output_dir = args.output_dir
-
     os.makedirs(output_dir, exist_ok=True)
-
     # Take care of distributed/parallel training
-
     model_to_save = model.module if hasattr(model, "module") else model
-
     model_to_save.save_pretrained(output_dir)
-
     tokenizer.save_pretrained(output_dir)
 
 
-class CastOutputToFloat(torch.nn.Sequential):
+# def find_all_linear_names(peft_model, int4=False, int8=False):
+#     cls = torch.nn.Linear
+#     if int4 or int8:
+#         import bitsandbytes as bnb
 
-    """Cast the output of the model to float"""
-
-    def forward(self, x):
-        return super().forward(x).to(torch.float32)
-
-
-def find_all_linear_names(peft_model, int4=False, int8=False):
-    cls = torch.nn.Linear
-    if int4 or int8:
-        import bitsandbytes as bnb
-
-        if int4:
-            cls = bnb.nn.Linear4bit
-        elif int8:
-            cls = bnb.nn.Linear8bitLt
-    lora_module_names = set()
-    for name, module in peft_model.named_modules():
-        if isinstance(module, cls):
-            # last layer is not add to lora_module_names
-            if "lm_head" in name:
-                continue
-            if "score" in name:
-                continue
-            names = name.split(".")
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-    return sorted(lora_module_names)
+#         if int4:
+#             cls = bnb.nn.Linear4bit
+#         elif int8:
+#             cls = bnb.nn.Linear8bitLt
+#     lora_module_names = set()
+#     for name, module in peft_model.named_modules():
+#         if isinstance(module, cls):
+#             # last layer is not add to lora_module_names
+#             if "lm_head" in name:
+#                 continue
+#             if "score" in name:
+#                 continue
+#             names = name.split(".")
+#             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+#     return sorted(lora_module_names)
 
 
 def main():
-    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments, ScriptArguments))
-
-    model_args, data_args, training_args, script_args = parser.parse_args_into_dataclasses()
+    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments, FinetuneArguments))
+    model_args, data_args, training_args, finetune_args = parser.parse_args_into_dataclasses()
     logger.info(f"Model args: {model_args}")
     logger.info(f"Data args: {data_args}")
     logger.info(f"Training args: {training_args}")
-    logger.info(f"Script args: {script_args}")
+    logger.info(f"Finetune args: {finetune_args}")
     logger.info(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
         + f" distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
@@ -405,7 +331,6 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
-
     # Load model
     config_class, model_class, tokenizer_class = MODEL_CLASSES[model_args.model_type]
 
@@ -442,10 +367,7 @@ def main():
                 model_args.model_name_or_path,
                 config=config,
                 cache_dir=model_args.cache_dir,
-                ignore_mismatched_sizes=True,
             )
-            model.to(training_args.device)
-
     else:
         raise ValueError("Error, model_name_or_path is None, RM must be loaded from a pre-trained model")
 
@@ -465,48 +387,44 @@ def main():
         tokenizer_name_or_path = model_args.model_name_or_path
     tokenizer = tokenizer_class.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)
 
-    template = get_template_and_fix_tokenizer(script_args.template_name, tokenizer)
+    template = get_template_and_fix_tokenizer(finetune_args.template_name, tokenizer)
 
-    if script_args.use_peft:
+    if finetune_args.use_peft:
         logger.info("Fine-tuning method: LoRA(PEFT)")
-        if script_args.peft_path is not None:
-            logger.info(f"Peft from pre-trained model: {script_args.peft_path}")
-            model = PeftModel.from_pretrained(model, script_args.peft_path, is_trainable=True)
+        if finetune_args.peft_path is not None:
+            logger.info(f"Peft from pre-trained model: {finetune_args.peft_path}")
+            model = PeftModel.from_pretrained(model, finetune_args.peft_path, is_trainable=True)
         else:
             logger.info("Init new peft model")
-            if model_args.load_in_8bit:
-                model = prepare_model_for_int8_training(model)
-
-            target_modules = script_args.target_modules.split(",") if script_args.target_modules else None
-
-            if target_modules and "all" in target_modules:
-                target_modules = find_all_linear_names(model, int4=False, int8=model_args.load_in_8bit)
-            modules_to_save = script_args.modules_to_save
-
+            if model_args.quantization_bit:
+                model = prepare_model_for_kbit_training(model)
+            if finetune_args.lora_target == "all":
+                lora_target = find_all_linear_names(model, model_args.quantization_bit)
+            else:
+                # support custom target modules/layers of LoRA
+                lora_target = [target.strip() for target in finetune_args.lora_target.split(",")]
+            modules_to_save = finetune_args.modules_to_save
             if modules_to_save is not None:
                 modules_to_save = modules_to_save.split(",")
 
-            logger.info(f"Peft target_modules: {target_modules}")
-            logger.info(f"Peft lora_rank: {script_args.lora_rank}")
+            logger.info(f"Peft lora_target: {lora_target}")
+            logger.info(f"Peft lora_rank: {finetune_args.lora_rank}")
 
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
-                target_modules=target_modules,
+                target_modules=lora_target,
                 inference_mode=False,
-                r=script_args.lora_rank,
-                lora_alpha=script_args.lora_alpha,
-                lora_dropout=script_args.lora_dropout,
+                r=finetune_args.lora_rank,
+                lora_alpha=finetune_args.lora_alpha,
+                lora_dropout=finetune_args.lora_dropout,
                 modules_to_save=modules_to_save,
             )
-
             model = get_peft_model(model, peft_config)
-
         model.print_trainable_parameters()
 
     else:
         logger.info("Fine-tuning method: Full parameters training")
         print_trainable_parameters(model)
-
     # Get reward dataset for tuning the reward model.
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -523,7 +441,6 @@ def main():
                 split=f"train[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
             )
-
             raw_datasets["train"] = load_dataset(
                 data_args.dataset_name,
                 data_args.dataset_config_name,
@@ -605,12 +522,11 @@ def main():
         preprocess_reward_function,
         tokenizer=tokenizer,
         template=template,
-        max_source_length=script_args.max_source_length,
-        max_target_length=script_args.args.max_target_length,
+        max_source_length=finetune_args.max_source_length,
+        max_target_length=finetune_args.args.max_target_length,
     )
 
     full_max_length = data_args.max_source_length + data_args.max_target_length
-
     train_dataset = None
     max_train_samples = 0
     if training_args.do_train:
@@ -623,6 +539,7 @@ def main():
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
         logger.debug(f"Example train_dataset[0]: {train_dataset[0]}")
+
         with training_args.main_process_first(desc="Train dataset tokenization"):
             tokenized_dataset = train_dataset.shuffle().map(
                 preprocessing_function_train,
@@ -669,12 +586,14 @@ def main():
             logger.debug(f"Num eval_samples: {len(eval_dataset)}")
             logger.debug("Tokenized eval example:")
             logger.debug(tokenizer.decode(eval_dataset[0]["input_ids_chosen"]))
+
     # Initialize our Trainer
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
     else:
         model.config.use_cache = True
+
     model.enable_input_require_grads()
     if torch.cuda.device_count() > 1:
         # Keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
@@ -705,7 +624,6 @@ def main():
         metrics["train_samples"] = max_train_samples
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
-        # trainer.save_state()
         model.config.use_cache = True  # enable cache after training
 
         if trainer.is_world_process_zero():

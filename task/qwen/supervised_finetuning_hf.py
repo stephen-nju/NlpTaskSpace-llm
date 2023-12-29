@@ -295,7 +295,7 @@ class FinetuneArguments:
         },
     )
 
-    use_lora: bool = field(default=True, metadata={"help": "Whether to using lora or full parameters tuning"})
+    use_peft: bool = field(default=True, metadata={"help": "Whether to using peft for tuning"})
     lora_rank: Optional[int] = field(default=8, metadata={"help": "The intrinsic dimension for LoRA fine-tuning."})
     lora_alpha: Optional[float] = field(
         default=32.0, metadata={"help": "The scale factor for LoRA fine-tuning (similar with the learning rate)."}
@@ -425,8 +425,9 @@ def main():
     model.config.use_cache = False  # silence the warnings. Please re-enable for inference!the datasets
 
     # 分布式训练
-    model.is_parallelizable = True
-    model.model_parallel = True
+    if torch.cuda.device_count() > 1:
+        model.is_parallelizable = True
+        model.model_parallel = True
 
     if finetune_args.quantization_bit is not None:
         # 启用模型量化需要开启
@@ -434,7 +435,7 @@ def main():
     # 获取数据处理的模板
     template = get_template_and_fix_tokenizer(finetune_args.template_name, tokenizer)
 
-    if finetune_args.use_lora:
+    if finetune_args.use_peft:
         if finetune_args.lora_ckpt_path:
             peft_model = PeftModel.from_pretrained(model, finetune_args.lora_ckpt_path, is_trainable=True)
             model = peft_model.merge_and_unload()

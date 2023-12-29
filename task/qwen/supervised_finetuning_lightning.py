@@ -159,7 +159,7 @@ class SupervisedFintuningModule(LightningModule):
             else:
                 self.log("Input embeddings are not normal nn.Embedding, cannot transform into noisy embedding.")
 
-        if self.args.use_lora:
+        if self.args.use_peft:
             # 使用lora的时候，设置输出层的精度
             output_layer_name = "lm_head"
             if hasattr(model, output_layer_name):
@@ -716,7 +716,7 @@ if __name__ == "__main__":
         default=None,
         help="quantization training like 4bit 8bit",
     )
-    parser.add_argument("--use_lora", type=bool, default=True, help="using lora")
+    parser.add_argument("--use_peft", type=bool, default=True, help="using lora")
     parser.add_argument("--lora_rank", type=int, default=8, help="The intrinsic dimension for LoRA fine-tuning.")
     parser.add_argument(
         "--lora_alpha",
