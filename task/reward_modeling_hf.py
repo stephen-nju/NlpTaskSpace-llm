@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import functools
 import math
 import os
 from dataclasses import dataclass, field
@@ -37,10 +38,29 @@ from transformers import (
 from transformers.trainer import TRAINING_ARGS_NAME
 
 from llm.src.datasets.preprocessing import preprocess_reward_function
+from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
 from llm.src.utils import print_trainable_parameters
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
+
+
+register_template(
+    name="qwen",
+    prefix=[{"token": "<|im_start|>"}, "system\n{{system}}"],
+    prompt=[
+        {"token": "<|im_start|>"},
+        "user\n{{query}}",
+        {"token": "<|im_end|>"},
+        "\n",
+        {"token": "<|im_start|>"},
+        "assistant\n",
+    ],
+    system="You are a helpful assistant.",
+    sep=[{"token": "<|im_end|>"}, "\n"],
+    stop_words=["<|im_end|>"],
+    efficient_eos=True,
+)
 
 
 MODEL_CLASSES = {
@@ -240,8 +260,8 @@ class RewardTrainer(Trainer):
         chosen_scores, rejected_scores = [], []
 
         # Compute pairwise loss. Only backprop on the different tokens before padding
-        # Inspired by: https://github.com/CarperAI/trlx/blob/main/examples/summarize_rlhf/reward_model/reward_model.py
-
+        # look
+        # https://github.com/microsoft/DeepSpeedExamples/blob/master/applications/DeepSpeed-Chat/dschat/utils/model/reward_model.py#L80
         loss = 0
         for i in range(batch_size):
             chosen_length = (chosen_input_ids[i] != self.tokenizer.pad_token_id).nonzero()[-1] + 1
@@ -270,16 +290,6 @@ class RewardTrainer(Trainer):
             return loss, [loss, chosen_scores, rejected_scores]
 
         return loss
-
-    # def compute_loss(self, model, inputs, return_outputs=False):
-    #     rewards_chosen = model(input_ids=inputs["input_ids_chosen"], attention_mask=inputs["attention_mask_chosen"])[0]
-    #     rewards_rejected = model(
-    #         input_ids=inputs["input_ids_rejected"], attention_mask=inputs["attention_mask_rejected"]
-    #     )[0]
-    #     loss = -torch.nn.functional.logsigmoid(rewards_chosen - rewards_rejected).mean()
-    #     if return_outputs:
-    #         return loss, {"rewards_chosen": rewards_chosen, "rewards_rejected": rewards_rejected}
-    #     return loss
 
     def evaluate(
         self,
@@ -455,14 +465,7 @@ def main():
         tokenizer_name_or_path = model_args.model_name_or_path
     tokenizer = tokenizer_class.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)
 
-    if tokenizer.eos_token_id is None:
-        # TODO
-        # for Qwen
-        tokenizer.eos_token = "<|endoftext|>"
-        logger.info("Add eos token: {}".format(tokenizer.eos_token))
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-        logger.info("Add pad token: {}".format(tokenizer.pad_token))
+    template = get_template_and_fix_tokenizer(script_args.template_name, tokenizer)
 
     if script_args.use_peft:
         logger.info("Fine-tuning method: LoRA(PEFT)")
@@ -503,6 +506,7 @@ def main():
     else:
         logger.info("Fine-tuning method: Full parameters training")
         print_trainable_parameters(model)
+
     # Get reward dataset for tuning the reward model.
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -597,6 +601,13 @@ def main():
 
     logger.info(f"Raw datasets: {raw_datasets}")
     # Preprocessing the datasets
+    preprocessing_function_train = functools.partial(
+        preprocess_reward_function,
+        tokenizer=tokenizer,
+        template=template,
+        max_source_length=script_args.max_source_length,
+        max_target_length=script_args.args.max_target_length,
+    )
 
     full_max_length = data_args.max_source_length + data_args.max_target_length
 
@@ -614,7 +625,7 @@ def main():
         logger.debug(f"Example train_dataset[0]: {train_dataset[0]}")
         with training_args.main_process_first(desc="Train dataset tokenization"):
             tokenized_dataset = train_dataset.shuffle().map(
-                preprocess_reward_function,
+                preprocessing_function_train,
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 remove_columns=train_dataset.column_names,
@@ -641,11 +652,9 @@ def main():
             if data_args.max_eval_samples is not None and data_args.max_eval_samples > 0:
                 max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
                 eval_dataset = eval_dataset.select(range(max_eval_samples))
-
             logger.debug(f"Example eval_dataset[0]: {eval_dataset[0]}")
-
             tokenized_dataset = eval_dataset.map(
-                preprocess_reward_function,
+                preprocessing_function_train,
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 remove_columns=eval_dataset.column_names,
@@ -683,7 +692,6 @@ def main():
             tokenizer=tokenizer, max_length=full_max_length, padding="max_length"
         ),
     )
-
     # Training
 
     if training_args.do_train:
@@ -698,7 +706,6 @@ def main():
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         # trainer.save_state()
-
         model.config.use_cache = True  # enable cache after training
 
         if trainer.is_world_process_zero():
