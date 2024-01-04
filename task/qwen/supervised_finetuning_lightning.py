@@ -184,9 +184,9 @@ class SupervisedFintuningModule(LightningModule):
                     # support custom target modules/layers of LoRA
                     lora_target = [target.strip() for target in self.args.lora_target.split(",")]
 
-            modules_to_save = self.args.lora_modules_to_save
-            if self.args.lora_modules_to_save is not None:
-                modules_to_save = [t.strip() for t in self.args.lora_modules_to_save.split(",")]
+            modules_to_save = self.args.modules_to_save
+            if self.args.modules_to_save is not None:
+                modules_to_save = [t.strip() for t in self.args.modules_to_save.split(",")]
 
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
@@ -731,9 +731,9 @@ if __name__ == "__main__":
         default=None,
         help="lora target name",
     )
-    parser.add_argument("--lora_ckpt_path", type=str, default=None, help="")
+    parser.add_argument("--peft_ckpt_path", type=str, default=None, help="")
     parser.add_argument(
-        "--lora_modules_to_save",
+        "--modules_to_save",
         type=str,
         default=None,
         help="List of modules apart from LoRA layers to be set as trainable and saved in the final checkpoint ",

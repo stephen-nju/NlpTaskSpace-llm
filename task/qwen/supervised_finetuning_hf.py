@@ -34,6 +34,7 @@ from transformers import (
     Seq2SeqTrainingArguments,
     set_seed,
 )
+from transformers.deepspeed import is_deepspeed_zero3_enabled
 from transformers.trainer_utils import get_last_checkpoint
 
 from llm.src.constant import IGNORE_INDEX
@@ -305,7 +306,7 @@ class FinetuneArguments:
         default=None,
         metadata={"help": "Name(s) of target modules to apply LoRA. Use commas to separate multiple modules."},
     )
-    lora_ckpt_path: Optional[str] = field(
+    peft_ckpt_path: Optional[str] = field(
         default=None,
         metadata={"help": "lora checkpoint path for evaluate"},
     )
@@ -318,6 +319,29 @@ class FinetuneArguments:
             raise ValueError("Need either a dataset name or a training/validation/test file.")
         if self.val_max_target_length is None:
             self.val_max_target_length = self.max_target_length
+
+
+def save_model(model, tokenizer, args):
+    """Save the model and the tokenizer."""
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Take care of distributed/parallel training
+    model_to_save = model.module if hasattr(model, "module") else model
+    model_to_save.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+
+
+def save_model_zero3(model, tokenizer, args, trainer):
+    """Save the model for deepspeed zero3.
+    refer https://github.com/lm-sys/FastChat/blob/main/fastchat/train/train_lora.py#L209
+    """
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    state_dict_zero3 = trainer.model_wrapped._zero3_consolidated_16bit_state_dict()
+    model_to_save = model.module if hasattr(model, "module") else model
+    model_to_save.save_pretrained(args.output_dir, state_dict=state_dict_zero3)
+    tokenizer.save_pretrained(output_dir)
 
 
 def main():
@@ -436,8 +460,8 @@ def main():
     template = get_template_and_fix_tokenizer(finetune_args.template_name, tokenizer)
 
     if finetune_args.use_peft:
-        if finetune_args.lora_ckpt_path:
-            peft_model = PeftModel.from_pretrained(model, finetune_args.lora_ckpt_path, is_trainable=True)
+        if finetune_args.peft_ckpt_path:
+            peft_model = PeftModel.from_pretrained(model, finetune_args.peft_ckpt_path, is_trainable=True)
             model = peft_model.merge_and_unload()
         else:
             logger.info(">>>init new lora model")
@@ -665,18 +689,17 @@ def main():
 
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
-        trainer.save_model()
         try:
             tokenizer.save_pretrained(training_args.output_dir)
         except:
             logger.warning("Cannot save tokenizer, please copy the files manually.")
 
-        # if trainer.is_world_process_zero():
-        #     logger.info(f"Saving model checkpoint to {training_args.output_dir}")
-        #     if is_deepspeed_zero3_enabled():
-        #         save_model_zero3(model, tokenizer, training_args, trainer)
-        #     else:
-        #         save_model(model, tokenizer, training_args)
+        if trainer.is_world_process_zero():
+            logger.info(f"Saving model checkpoint to {training_args.output_dir}")
+            if is_deepspeed_zero3_enabled():
+                save_model_zero3(model, tokenizer, training_args, trainer)
+            else:
+                save_model(model, tokenizer, training_args)
 
     # Evaluation
     if training_args.do_eval:

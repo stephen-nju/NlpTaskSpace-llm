@@ -3,7 +3,6 @@
 import argparse
 import functools
 import glob
-import logging
 import math
 import os
 from itertools import chain
@@ -17,24 +16,45 @@ from datasets import load_dataset
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning import LightningModule, Trainer, seed_everything
 from lightning.pytorch.strategies import DeepSpeedStrategy, FSDPStrategy
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from loguru import logger
+from peft import (
+    LoraConfig,
+    PeftModel,
+    TaskType,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+)
 from torch.utils.data import DataLoader
 from transformers import (
+    SAFE_WEIGHTS_NAME,
+    WEIGHTS_NAME,
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    BloomForCausalLM,
+    BloomTokenizerFast,
+    LlamaTokenizer,
+    PreTrainedModel,
+    cached_file,
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup,
 )
+from trl import AutoModelForCausalLMWithValueHead
 
 from llm.src.callbacks import HFModelCheckpoint
 from llm.src.constant import IGNORE_INDEX
 from llm.src.datasets.preprocessing import preprocess_reward_function
 from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
-from llm.src.utils import find_all_linear_names
+from llm.src.utils import find_all_linear_names, print_trainable_parameters
 from metrics.language_model import AccMetric
+
+MODEL_CLASSES = {
+    "bloom": (AutoConfig, BloomForCausalLM, BloomTokenizerFast),
+    "llama": (AutoConfig, AutoModelForCausalLM, LlamaTokenizer),
+    "auto": (AutoConfig, AutoModelForCausalLM, AutoTokenizer),
+}
 
 
 class RewardModule(LightningModule):
@@ -64,148 +84,187 @@ class RewardModule(LightningModule):
             )
         )
 
+    @staticmethod
+    def load_valuehead_params(path_or_repo_id: str, model_args) -> Dict[str, torch.Tensor]:
+        r"""
+        Loads value head parameters from Hugging Face Hub or local disk.
+
+        Returns: dict with keys `v_head.summary.weight` and `v_head.summary.bias`.
+        """
+        kwargs = {
+            "path_or_repo_id": path_or_repo_id,
+            "cache_dir": model_args.cache_dir,
+        }
+
+        try:
+            from safetensors import safe_open
+
+            vhead_file = cached_file(filename=SAFE_WEIGHTS_NAME, **kwargs)
+            with safe_open(vhead_file, framework="pt", device="cpu") as f:
+                return {
+                    "v_head.summary.weight": f.get_tensor("v_head.summary.weight"),
+                    "v_head.summary.bias": f.get_tensor("v_head.summary.bias"),
+                }
+        except Exception as err:
+            logger.info("Failed to load {}: {}".format(SAFE_WEIGHTS_NAME, str(err)))
+
+        try:
+            vhead_file = cached_file(filename=WEIGHTS_NAME, **kwargs)
+            return torch.load(vhead_file, map_location="cpu")
+        except Exception as err:
+            logger.info("Failed to load {}: {}".format(WEIGHTS_NAME, str(err)))
+
+        logger.warning("Provided path ({}) does not contain valuehead weights.".format(path_or_repo_id))
+        return None
+
     def setup(self, stage):
         if self.is_deepspeed_zero3_enabled:
             from transformers.integrations import HfDeepSpeedConfig
 
             self.ds_config = HfDeepSpeedConfig(self.trainer.strategy.config)
 
-        self.config = AutoConfig.from_pretrained(self.args.model_name_or_path, trust_remote_code=True)
-        if self.args.quantization_bit is not None:
-            print(f"Quantized to {self.args.quantization_bit}")
-            if self.is_deepspeed_zero3_enabled:
-                raise ValueError("DeepSpeed ZeRO-3 is incompatible with quantization.")
-            if self.args.quantization_bit == "4bit":
-                # load_in_4bit = (True,)
-                quantization_config = BitsAndBytesConfig(
-                    bnb_4bit_compute_dtype=torch.bfloat16,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
+        config_class, model_class, tokenizer_class = MODEL_CLASSES[self.args.model_type]
+
+        if self.args.model_name_or_path:
+            torch_dtype = (
+                self.args.torch_dtype
+                if self.args.torch_dtype in ["auto", None]
+                else getattr(torch, self.args.torch_dtype)
+            )
+            config = config_class.from_pretrained(
+                self.args.model_name_or_path,
+                num_labels=1,
+                torch_dtype=torch_dtype,
+                trust_remote_code=self.args.trust_remote_code,
+                cache_dir=self.args.cache_dir,
+            )
+
+            if self.args.model_type in ["bloom", "llama"]:
+                model = model_class.from_pretrained(
+                    self.args.model_name_or_path,
+                    config=config,
+                    torch_dtype=torch_dtype,
+                    load_in_4bit=self.args.load_in_4bit,
+                    load_in_8bit=self.args.load_in_8bit,
+                    trust_remote_code=self.args.trust_remote_code,
                 )
-            elif self.args.quantization_bit == "8bit":
-                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+
             else:
-                raise ValueError("unsupport quantization_bit")
-
-            model = AutoModelForCausalLM.from_pretrained(
-                self.args.model_name_or_path,
-                from_tf=bool(".ckpt" in self.args.model_name_or_path),
-                config=self.config,
-                quantization_config=quantization_config,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
-            )
-
+                model = model_class.from_pretrained(
+                    self.args.model_name_or_path,
+                    config=config,
+                    cache_dir=self.args.cache_dir,
+                )
         else:
-            # 使用bf16 来加载模型
-            self.trainer.print(f"model config===\n{self.config}")
-            model = AutoModelForCausalLM.from_pretrained(
-                self.args.model_name_or_path,
-                from_tf=bool(".ckpt" in self.args.model_name_or_path),
-                config=self.config,
-                trust_remote_code=True,
-                torch_dtype="auto",
-            )
-        # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-        # on a small vocab and want a smaller embedding size, remove this test.
+            raise ValueError("Error, model_name_or_path is None, RM must be loaded from a pre-trained model")
 
-        # embedding_size = model.get_input_embeddings().weight.shape[0]
-        # if len(tokenizer) > embedding_size:
-        #     model.resize_token_embeddings(len(tokenizer))
+        model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
 
-        # model.supports_gradient_checkpointing = True  #
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
+        # 参考llama facotry构建valuehead model
+        def patch_valuehead_model(model: "AutoModelForCausalLMWithValueHead") -> None:
+            def tie_weights(self: "AutoModelForCausalLMWithValueHead") -> None:
+                if isinstance(self.pretrained_model, PreTrainedModel):
+                    self.pretrained_model.tie_weights()
 
-        model.config.use_cache = False  # silence the warnings. Please re-enable for inference!the datasets
+            def get_input_embeddings(self: "AutoModelForCausalLMWithValueHead") -> torch.nn.Module:
+                if isinstance(self.pretrained_model, PreTrainedModel):
+                    return self.pretrained_model.get_input_embeddings()
 
-        # 分布式训练
-        model.is_parallelizable = True
-        model.model_parallel = True
+            ignore_modules = [name for name, _ in model.named_parameters() if "pretrained_model" in name]
+            setattr(model, "_keys_to_ignore_on_save", ignore_modules)
+            setattr(model, "tie_weights", MethodType(tie_weights, model))
+            setattr(model, "get_input_embeddings", MethodType(get_input_embeddings, model))
 
-        if self.args.quantization_bit is not None:
-            # 启用模型量化需要开启
-            model = prepare_model_for_kbit_training(model)
+        patch_valuehead_model(model)
 
-        # Set NEFTune trick for fine-tuning
-        if self.args.neft_alpha > 0:
-            input_embed = model.get_input_embeddings()
-            if isinstance(input_embed, torch.nn.Embedding):
+        if self.args.vhead_ckpt_path is not None:
+            vhead_path = self.args.vhead_ckpt_path
+        else:
+            vhead_path = self.args.model_name_or_path
 
-                def noisy_forward(self: torch.nn.Embedding, x: torch.Tensor) -> torch.Tensor:
-                    embeddings = input_embed.__class__.forward(self, x)
-                    dims = self.num_embeddings * self.embedding_dim
-                    mag_norm = self.args.neft_alpha / (dims**0.5)
-                    embeddings += torch.zeros_like(embeddings).uniform_(-mag_norm, mag_norm)
-                    return embeddings
+        vhead_param = self.load_valuehead_params(vhead_path, self.args)
+        if vhead_param is not None:
+            model.load_state_dict(vhead_param, strict=True)
 
-                # 将方法绑定到forward上,参考medicalGPT
-                input_embed.forward = MethodType(noisy_forward, input_embed)
-                self.log("Using noisy embedding with alpha={:.2f}".format(self.args.neft_alpha))
+        # Load tokenizer
+        if getattr(config, "model_type", None) == "bloom":
+            self.args.use_fast_tokenizer = True
+        tokenizer_kwargs = {
+            "cache_dir": self.args.cache_dir,
+            "use_fast": self.args.use_fast_tokenizer,
+            "trust_remote_code": self.args.trust_remote_code,
+        }
+
+        # 如果没有指定
+        tokenizer_name_or_path = self.args.tokenizer_name_or_path
+        if not tokenizer_name_or_path:
+            tokenizer_name_or_path = self.args.model_name_or_path
+        tokenizer = tokenizer_class.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)
+
+        template = get_template_and_fix_tokenizer(self.args.template_name, tokenizer)
+
+        if self.args.use_peft:
+            logger.info("Fine-tuning method: LoRA(PEFT)")
+            if self.args.peft_ckpt_path is not None:
+                logger.info(f"Peft from pre-trained model: {self.args.peft_ckpt_path}")
+                model = PeftModel.from_pretrained(model, self.args.peft_ckpt_path, is_trainable=True)
             else:
-                self.log("Input embeddings are not normal nn.Embedding, cannot transform into noisy embedding.")
-
-        if self.args.use_lora:
-            if isinstance(self.args.lora_target, str):
+                logger.info("Init new peft model")
+                if self.args.quantization_bit:
+                    model = prepare_model_for_kbit_training(model)
                 if self.args.lora_target == "all":
                     lora_target = find_all_linear_names(model, self.args.quantization_bit)
                 else:
                     # support custom target modules/layers of LoRA
                     lora_target = [target.strip() for target in self.args.lora_target.split(",")]
-            ### TODO 添加全量lora 的微调
-            peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                target_modules=lora_target,
-                inference_mode=False,
-                r=self.args.lora_rank,
-                lora_alpha=self.args.lora_alpha,
-                lora_dropout=self.args.lora_dropout,
-            )
-            # adalora 会出现 https://github.com/huggingface/peft/issues/479
+                modules_to_save = self.args.modules_to_save
+                if modules_to_save is not None:
+                    modules_to_save = modules_to_save.split(",")
 
-            model = get_peft_model(model, peft_config)
+                logger.info(f"Peft lora_target: {lora_target}")
+                logger.info(f"Peft lora_rank: {self.args.lora_rank}")
 
-            # 分布式训练
-            model.is_parallelizable = True
-            model.model_parallel = True
+                peft_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    target_modules=lora_target,
+                    inference_mode=False,
+                    r=self.args.lora_rank,
+                    lora_alpha=self.args.lora_alpha,
+                    lora_dropout=self.args.lora_dropout,
+                    modules_to_save=modules_to_save,
+                )
+                model = get_peft_model(model, peft_config)
             model.print_trainable_parameters()
 
-        self.model = model
-        self.generation_config = model.generation_config
-        self.model.print_trainable_parameters()
-        # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
-        # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-        # (the dataset will be downloaded automatically from the datasets Hub).
-        #
-        # For CSV/JSON files, this script will use the column called 'text' or the first column if no column called
-        # 'text' is found. You can easily tweak this behavior (see below).
-        #
-        # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-        # download the dataset.
+        else:
+            logger.info("Fine-tuning method: Full parameters training")
+            print_trainable_parameters(model)
+
+        # Get reward dataset for tuning the reward model.
         if self.args.dataset_name is not None:
+            # Downloading and loading a dataset from the hub.
             raw_datasets = load_dataset(
                 self.args.dataset_name,
                 self.args.dataset_config_name,
-                streaming=self.args.streaming,
+                cache_dir=self.args.cache_dir,
             )
+
             if "validation" not in raw_datasets.keys():
                 raw_datasets["validation"] = load_dataset(
                     self.args.dataset_name,
                     self.args.dataset_config_name,
                     split=f"train[:{self.args.validation_split_percentage}%]",
-                    streaming=self.args.streaming,
+                    cache_dir=self.args.cache_dir,
                 )
-
                 raw_datasets["train"] = load_dataset(
                     self.args.dataset_name,
                     self.args.dataset_config_name,
                     split=f"train[{self.args.validation_split_percentage}%:]",
-                    streaming=self.args.streaming,
+                    cache_dir=self.args.cache_dir,
                 )
 
         else:
             data_files = {}
-            dataset_args = {}
             if self.args.train_data is not None:
                 train_dof = [s.strip() for s in self.args.train_data.strip().split(",")]
             else:
@@ -241,7 +300,6 @@ class RewardModule(LightningModule):
                             + glob.glob(f"{dof}/**/*.json", recursive=True)
                             + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
                         )
-
                         types = [f.split(".")[-1] for f in files]
                         if len(set(types)) > 1:
                             raise ValueError(
@@ -250,78 +308,101 @@ class RewardModule(LightningModule):
                         dev_files.extend(files)
                     else:
                         raise ValueError("train data should be valid file path or direcotory path split by ','")
-                self.trainer.print(f"eval files: {dev_files}")
+                logger.info(f"eval files: {dev_files}")
                 data_files["validation"] = dev_files
 
-            self.trainer.print(f"loading data files={data_files}")
-            extension = "text" if data_files["train"][0].endswith("txt") else "json"
-
             raw_datasets = load_dataset(
-                extension,
+                "json",
                 data_files=data_files,
-                **dataset_args,
+                cache_dir=self.args.cache_dir,
             )
+
             # If no validation data is there, validation_split_percentage will be used to divide the dataset.
             if "validation" not in raw_datasets.keys():
                 raw_datasets["validation"] = load_dataset(
-                    extension,
+                    "json",
                     data_files=data_files,
                     split=f"train[:{self.args.validation_split_percentage}%]",
-                    **dataset_args,
+                    cache_dir=self.args.cache_dir,
                 )
 
                 raw_datasets["train"] = load_dataset(
-                    extension,
+                    "json",
                     data_files=data_files,
                     split=f"train[{self.args.validation_split_percentage}%:]",
-                    **dataset_args,
+                    cache_dir=self.args.cache_dir,
                 )
-        # Preprocessing the datasets.
-        column_names = list(raw_datasets["train"].features)
 
+        logger.info(f"Raw datasets: {raw_datasets}")
+        # Preprocessing the datasets
         preprocessing_function_train = functools.partial(
             preprocess_reward_function,
-            tokenizer=self.tokenizer,
-            template=self.template,
+            tokenizer=tokenizer,
+            template=template,
             max_source_length=self.args.max_source_length,
             max_target_length=self.args.max_target_length,
         )
 
-        if not self.args.streaming:
-            lm_datasets = raw_datasets.map(
-                preprocessing_function_train,
-                batched=True,
-                num_proc=self.args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not self.args.overwrite_cache,
-                desc="Running tokenizer on dataset",
-            )
-        else:
-            lm_datasets = raw_datasets.map(
-                preprocessing_function_train,
-                batched=True,
-                remove_columns=column_names,
-            )
-
+        full_max_length = self.args.max_source_length + self.args.max_target_length
+        train_dataset = None
         max_train_samples = 0
-        self.train_dataset = lm_datasets["train"]
-        max_train_samples = len(self.train_dataset)
-        if self.args.max_train_samples is not None and self.args.max_train_samples > 0:
-            max_train_samples = min(len(self.train_dataset), self.args.max_train_samples)
-            self.train_dataset = self.train_dataset.select(range(max_train_samples))
+        if self.args.do_train:
+            if "train" not in raw_datasets:
+                raise ValueError("--do_train requires a train dataset")
 
-        self.trainer.print(f"Num train_samples: {len(self.train_dataset)}")
-        self.trainer.print("Tokenized training example:")
-        self.print_example(self.train_dataset[0])
+            train_dataset = raw_datasets["train"]
+            max_train_samples = len(train_dataset)
+            if self.args.max_train_samples is not None and self.args.max_train_samples > 0:
+                max_train_samples = min(len(train_dataset), self.args.max_train_samples)
+                train_dataset = train_dataset.select(range(max_train_samples))
+            logger.debug(f"Example train_dataset[0]: {train_dataset[0]}")
 
-        # self.trainer.print(self.tokenizer.decode(self.train_dataset[0]["input_ids"]))
+            with self.args.main_process_first(desc="Train dataset tokenization"):
+                tokenized_dataset = train_dataset.shuffle().map(
+                    preprocessing_function_train,
+                    batched=True,
+                    num_proc=self.args.preprocessing_num_workers,
+                    remove_columns=train_dataset.column_names,
+                    load_from_cache_file=not self.args.overwrite_cache,
+                    desc="Running tokenizer on dataset",
+                )
 
+                train_dataset = tokenized_dataset.filter(
+                    lambda x: 0 < len(x["input_ids_rejected"]) <= full_max_length
+                    and 0 < len(x["input_ids_chosen"]) <= full_max_length
+                )
+                logger.debug(f"Num train_samples: {len(train_dataset)}")
+                logger.debug("Tokenized training example:")
+                logger.debug(tokenizer.decode(train_dataset[0]["input_ids_chosen"]))
+
+        eval_dataset = None
         max_eval_samples = 0
-        self.dev_dataset = lm_datasets["validation"]
-        max_eval_samples = len(self.dev_dataset)
-        if self.args.max_eval_samples is not None and self.args.max_eval_samples > 0:
-            max_eval_samples = min(len(self.dev_dataset), self.args.max_eval_samples)
-            self.dev_dataset = self.dev_dataset.select(range(max_eval_samples))
+        if self.args.do_eval:
+            with self.args.main_process_first(desc="Eval dataset tokenization"):
+                if "validation" not in raw_datasets:
+                    raise ValueError("--do_eval requires a validation dataset")
+                eval_dataset = raw_datasets["validation"]
+                max_eval_samples = len(eval_dataset)
+                if self.args.max_eval_samples is not None and self.args.max_eval_samples > 0:
+                    max_eval_samples = min(len(eval_dataset), self.args.max_eval_samples)
+                    eval_dataset = eval_dataset.select(range(max_eval_samples))
+                logger.debug(f"Example eval_dataset[0]: {eval_dataset[0]}")
+                tokenized_dataset = eval_dataset.map(
+                    preprocessing_function_train,
+                    batched=True,
+                    num_proc=self.args.preprocessing_num_workers,
+                    remove_columns=eval_dataset.column_names,
+                    load_from_cache_file=not self.args.overwrite_cache,
+                    desc="Running tokenizer on dataset",
+                )
+
+                eval_dataset = tokenized_dataset.filter(
+                    lambda x: 0 < len(x["input_ids_rejected"]) <= full_max_length
+                    and 0 < len(x["input_ids_chosen"]) <= full_max_length
+                )
+                logger.debug(f"Num eval_samples: {len(eval_dataset)}")
+                logger.debug("Tokenized eval example:")
+                logger.debug(tokenizer.decode(eval_dataset[0]["input_ids_chosen"]))
 
     @property
     def deepspeed_offload(self) -> bool:

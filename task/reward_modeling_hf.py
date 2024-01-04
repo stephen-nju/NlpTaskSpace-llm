@@ -5,6 +5,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from glob import glob
+from types import MethodType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -32,7 +33,10 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
-from transformers.trainer import TRAINING_ARGS_NAME
+from transformers.deepspeed import is_deepspeed_zero3_enabled
+from transformers.trainer import SAFE_WEIGHTS_NAME, TRAINING_ARGS_NAME, WEIGHTS_NAME
+from transformers.utils import cached_file
+from trl import AutoModelForCausalLMWithValueHead
 
 from llm.src.datasets.preprocessing import preprocess_reward_function
 from llm.src.datasets.template import get_template_and_fix_tokenizer, register_template
@@ -183,13 +187,15 @@ class DataArguments:
 
 @dataclass
 class FinetuneArguments:
+    template_name: Optional[str] = field(default="qwen")
     use_peft: bool = field(default=True, metadata={"help": "Whether to use peft"})
     lora_target: Optional[str] = field(default="all")
     lora_rank: Optional[int] = field(default=8)
     lora_dropout: Optional[float] = field(default=0.05)
     lora_alpha: Optional[float] = field(default=32.0)
     modules_to_save: Optional[str] = field(default=None)
-    peft_path: Optional[str] = field(default=None)
+    peft_ckpt_path: Optional[str] = field(default=None)
+    vhead_ckpt_path: Optional[str] = field(default=None)
 
 
 def compute_metrics(eval_preds):
@@ -204,6 +210,57 @@ def compute_metrics(eval_preds):
     # MAE
     mae = mean_absolute_error(labels, preds)
     return {"mse": mse, "mae": mae}
+
+
+def save_model(model, tokenizer, args):
+    """Save the model and the tokenizer."""
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    model_to_save = model.module if hasattr(model, "module") else model
+    model_to_save.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+
+
+def save_model_zero3(model, tokenizer, args, trainer):
+    """Save the model for deepspeed zero3.
+    refer https://github.com/lm-sys/FastChat/blob/main/fastchat/train/train_lora.py#L209
+    """
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    state_dict_zero3 = trainer.model_wrapped._zero3_consolidated_16bit_state_dict()
+    model_to_save = model.module if hasattr(model, "module") else model
+    model_to_save.save_pretrained(args.output_dir, state_dict=state_dict_zero3)
+    tokenizer.save_pretrained(output_dir)
+
+
+def load_valuehead_params(path_or_repo_id: str, model_args: "ModelArguments") -> Dict[str, torch.Tensor]:
+    r"""
+    Loads value head parameters from Hugging Face Hub or local disk.
+
+    Returns: dict with keys `v_head.summary.weight` and `v_head.summary.bias`.
+    """
+    kwargs = {"path_or_repo_id": path_or_repo_id, "cache_dir": model_args.cache_dir, "token": model_args.hf_hub_token}
+
+    try:
+        from safetensors import safe_open
+
+        vhead_file = cached_file(filename=SAFE_WEIGHTS_NAME, **kwargs)
+        with safe_open(vhead_file, framework="pt", device="cpu") as f:
+            return {
+                "v_head.summary.weight": f.get_tensor("v_head.summary.weight"),
+                "v_head.summary.bias": f.get_tensor("v_head.summary.bias"),
+            }
+    except Exception as err:
+        logger.info("Failed to load {}: {}".format(SAFE_WEIGHTS_NAME, str(err)))
+
+    try:
+        vhead_file = cached_file(filename=WEIGHTS_NAME, **kwargs)
+        return torch.load(vhead_file, map_location="cpu")
+    except Exception as err:
+        logger.info("Failed to load {}: {}".format(WEIGHTS_NAME, str(err)))
+
+    logger.warning("Provided path ({}) does not contain valuehead weights.".format(path_or_repo_id))
+    return None
 
 
 class RewardDataCollatorWithPadding(DataCollatorWithPadding):
@@ -278,44 +335,6 @@ class RewardTrainer(Trainer):
 
         return loss
 
-    def save_model(self, output_dir=None, _internal_call=False):
-        """Save the LoRA model."""
-        os.makedirs(output_dir, exist_ok=True)
-        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
-        self.model.save_pretrained(output_dir)
-
-
-def save_model(model, tokenizer, args):
-    """Save the model and the tokenizer."""
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-    # Take care of distributed/parallel training
-    model_to_save = model.module if hasattr(model, "module") else model
-    model_to_save.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-
-
-# def find_all_linear_names(peft_model, int4=False, int8=False):
-#     cls = torch.nn.Linear
-#     if int4 or int8:
-#         import bitsandbytes as bnb
-
-#         if int4:
-#             cls = bnb.nn.Linear4bit
-#         elif int8:
-#             cls = bnb.nn.Linear8bitLt
-#     lora_module_names = set()
-#     for name, module in peft_model.named_modules():
-#         if isinstance(module, cls):
-#             # last layer is not add to lora_module_names
-#             if "lm_head" in name:
-#                 continue
-#             if "score" in name:
-#                 continue
-#             names = name.split(".")
-#             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-#     return sorted(lora_module_names)
-
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments, FinetuneArguments))
@@ -340,10 +359,6 @@ def main():
             if model_args.torch_dtype in ["auto", None]
             else getattr(torch, model_args.torch_dtype)
         )
-        # world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        # if world_size > 1:
-        #     model_args.device_map = {"": int(os.environ.get("LOCAL_RANK", "0"))}
-
         config = config_class.from_pretrained(
             model_args.model_name_or_path,
             num_labels=1,
@@ -371,10 +386,37 @@ def main():
     else:
         raise ValueError("Error, model_name_or_path is None, RM must be loaded from a pre-trained model")
 
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
+
+    # 参考llama facotry构建valuehead model
+    def patch_valuehead_model(model: "AutoModelForCausalLMWithValueHead") -> None:
+        def tie_weights(self: "AutoModelForCausalLMWithValueHead") -> None:
+            if isinstance(self.pretrained_model, PreTrainedModel):
+                self.pretrained_model.tie_weights()
+
+        def get_input_embeddings(self: "AutoModelForCausalLMWithValueHead") -> torch.nn.Module:
+            if isinstance(self.pretrained_model, PreTrainedModel):
+                return self.pretrained_model.get_input_embeddings()
+
+        ignore_modules = [name for name, _ in model.named_parameters() if "pretrained_model" in name]
+        setattr(model, "_keys_to_ignore_on_save", ignore_modules)
+        setattr(model, "tie_weights", MethodType(tie_weights, model))
+        setattr(model, "get_input_embeddings", MethodType(get_input_embeddings, model))
+
+    patch_valuehead_model(model)
+
+    if finetune_args.vhead_ckpt_path is not None:
+        vhead_path = finetune_args.vhead_ckpt_path
+    else:
+        vhead_path = model_args.model_name_or_path
+
+    vhead_param = load_valuehead_params(vhead_path, model_args)
+    if vhead_param is not None:
+        model.load_state_dict(vhead_param, strict=True)
+
     # Load tokenizer
     if getattr(config, "model_type", None) == "bloom":
         model_args.use_fast_tokenizer = True
-
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
@@ -391,9 +433,9 @@ def main():
 
     if finetune_args.use_peft:
         logger.info("Fine-tuning method: LoRA(PEFT)")
-        if finetune_args.peft_path is not None:
-            logger.info(f"Peft from pre-trained model: {finetune_args.peft_path}")
-            model = PeftModel.from_pretrained(model, finetune_args.peft_path, is_trainable=True)
+        if finetune_args.peft_ckpt_path is not None:
+            logger.info(f"Peft from pre-trained model: {finetune_args.peft_ckpt_path}")
+            model = PeftModel.from_pretrained(model, finetune_args.peft_ckpt_path, is_trainable=True)
         else:
             logger.info("Init new peft model")
             if model_args.quantization_bit:
@@ -425,6 +467,7 @@ def main():
     else:
         logger.info("Fine-tuning method: Full parameters training")
         print_trainable_parameters(model)
+
     # Get reward dataset for tuning the reward model.
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -523,7 +566,7 @@ def main():
         tokenizer=tokenizer,
         template=template,
         max_source_length=finetune_args.max_source_length,
-        max_target_length=finetune_args.args.max_target_length,
+        max_target_length=finetune_args.max_target_length,
     )
 
     full_max_length = data_args.max_source_length + data_args.max_target_length
@@ -624,15 +667,17 @@ def main():
         metrics["train_samples"] = max_train_samples
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
-        model.config.use_cache = True  # enable cache after training
 
         if trainer.is_world_process_zero():
-            logger.debug(f"Training metrics: {metrics}")
             logger.info(f"Saving model checkpoint to {training_args.output_dir}")
-            save_model(model, tokenizer, training_args)
+            if is_deepspeed_zero3_enabled():
+                save_model_zero3(model, tokenizer, training_args, trainer)
+            else:
+                save_model(model, tokenizer, training_args)
+
+        model.config.use_cache = True  # enable cache after training
 
     # Evaluation
-
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()

@@ -26,6 +26,7 @@ def get_nb_trainable_parameters(model):
 
     return trainable_params, all_param
 
+
 def print_trainable_parameters(model):
     """
     Prints the number of trainable parameters in the model.
@@ -35,9 +36,6 @@ def print_trainable_parameters(model):
     print(
         f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}"
     )
-
-
-
 
 
 def find_all_linear_names(model, quantization_bits: str):
