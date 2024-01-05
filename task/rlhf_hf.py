@@ -1,3 +1,4 @@
+import functools
 import math
 import os
 import sys
@@ -24,10 +25,10 @@ from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
     AutoTokenizer,
     BloomForCausalLM,
     BloomTokenizerFast,
+    DataCollatorWithPadding,
     GenerationConfig,
     HfArgumentParser,
     InfNanRemoveLogitsProcessor,
@@ -51,6 +52,7 @@ from trl import (
     set_seed,
 )
 
+from llm.src.datasets.preprocessing import preprocess_ppo_function
 from llm.src.datasets.template import get_template_and_fix_tokenizer
 from llm.src.utils import find_all_linear_names, print_trainable_parameters
 
@@ -79,13 +81,13 @@ def get_logits_processor() -> "LogitsProcessorList":
     return logits_processor
 
 
-def load_valuehead_params(path_or_repo_id: str, model_args) -> Dict[str, torch.Tensor]:
+def load_valuehead_params(path_or_repo_id: str, script_args) -> Dict[str, torch.Tensor]:
     r"""
     Loads value head parameters from Hugging Face Hub or local disk.
 
     Returns: dict with keys `v_head.summary.weight` and `v_head.summary.bias`.
     """
-    kwargs = {"path_or_repo_id": path_or_repo_id, "cache_dir": model_args.cache_dir, "token": model_args.hf_hub_token}
+    kwargs = {"path_or_repo_id": path_or_repo_id, "cache_dir": script_args.cache_dir, "token": script_args.hf_hub_token}
 
     try:
         from safetensors import safe_open
@@ -379,7 +381,7 @@ class RLHFTrianer(PPOTrainer, Trainer):
         self,
         args: RLHFTraingArguemnts = None,
         reward_model: AutoModelForCausalLMWithValueHead = None,
-        tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        reward_tokenizer: Optional[PreTrainedTokenizerBase] = None,
         callbacks: Optional[List[TrainerCallback]] = None,
         **kwargs,
     ):
@@ -391,13 +393,15 @@ class RLHFTrianer(PPOTrainer, Trainer):
             args = TrainingArguments(output_dir=output_dir)
 
         self.args = args
-        self.tokenizer = tokenizer
+        self.reward_tokenizer = reward_tokenizer
         self.reward_model = reward_model
         self.state = TrainerState(
             is_local_process_zero=self.is_local_process_zero(),
             is_world_process_zero=self.is_world_process_zero(),
         )
         self.control = TrainerControl()
+        # todo 配置模型生成的超参
+        self.generation_config = GenerationConfig()
 
     def ppo_train(self, resume_from_checkpoint: Optional[str] = None) -> None:
         r"""
@@ -445,7 +449,6 @@ class RLHFTrianer(PPOTrainer, Trainer):
             logger.info("  Total training steps = {}".format(max_steps))
 
         unwrapped_model: "AutoModelForCausalLMWithValueHead" = self.accelerator.unwrap_model(self.model)
-
         dataiter = iter(self.dataloader)
         loss_meter = AverageMeter()
         reward_meter = AverageMeter()
@@ -487,7 +490,7 @@ class RLHFTrianer(PPOTrainer, Trainer):
                     batch["query"] = self.tokenizer.batch_decode(queries, skip_special_tokens=True)
                     batch["response"] = self.tokenizer.batch_decode(responses, skip_special_tokens=True)
                     self.log_stats(stats, batch, rewards)
-                except:
+                except Exception:
                     logger.warning("Failed to save stats due to unknown errors.")
 
             self.state.global_step += 1
@@ -723,30 +726,17 @@ def main():
                 script_args.model_name_or_path,
                 config=config,
                 torch_dtype=torch_dtype,
-                load_in_4bit=script_args.load_in_4bit,
-                load_in_8bit=script_args.load_in_8bit,
+                load_in_4bit=script_args.quantization_bit == "4bit",
+                load_in_8bit=script_args.quantization_bit == "8bit",
                 trust_remote_code=script_args.trust_remote_code,
             )
-
         else:
             model = model_class.from_pretrained(
                 script_args.model_name_or_path,
                 config=config,
                 cache_dir=script_args.cache_dir,
+                trust_remote_code=script_args.trust_remote_code,
             )
-
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
-    patch_valuehead_model(model)
-
-    if script_args.vhead_ckpt_path is not None:
-        vhead_path = script_args.vhead_ckpt_path
-    else:
-        vhead_path = script_args.model_name_or_path
-
-    vhead_param = load_valuehead_params(vhead_path, script_args)
-    if vhead_param is not None:
-        model.load_state_dict(vhead_param, strict=True)
-
         if script_args.use_peft:
             logger.info("Fine-tuning method: LoRA(PEFT)")
             if script_args.peft_ckpt_path is not None:
@@ -783,36 +773,22 @@ def main():
         else:
             logger.info("Fine-tuning method: Full parameters training")
             print_trainable_parameters(model)
+        model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
+        patch_valuehead_model(model)
 
-        peft_config = None
-        if script_args.use_peft:
-            logger.info("Fine-tuning method: LoRA(PEFT)")
-            peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                target_modules=script_args.target_modules,
-                inference_mode=False,
-                r=script_args.lora_rank,
-                lora_alpha=script_args.lora_alpha,
-                lora_dropout=script_args.lora_dropout,
-            )
+        if script_args.vhead_ckpt_path is not None:
+            vhead_path = script_args.vhead_ckpt_path
         else:
-            logger.info("Fine-tuning method: Full parameters training")
-
-        model = AutoModelForCausalLMWithValueHead.from_pretrained(
-            script_args.model_name_or_path,
-            config=config,
-            torch_dtype=torch_dtype,
-            device_map=script_args.device_map,
-            trust_remote_code=script_args.trust_remote_code,
-            peft_config=peft_config if script_args.use_peft else None,
-        )
-
-        print_trainable_parameters(model)
-
+            vhead_path = script_args.model_name_or_path
+        vhead_param = load_valuehead_params(vhead_path, script_args)
+        if vhead_param is not None:
+            model.load_state_dict(vhead_param, strict=True)
+            logger.info("Load saved value head parmas")
     else:
-        raise ValueError("Error, model_name_or_path is None, RM must be loaded from a pre-trained model")
+        raise ValueError("Error model_name_or_path is None RLHF should load a model")
+
+    # Load reward model
     if script_args.reward_model_name_or_path is not None:
-        # Load reward model
         default_device = "cuda" if torch.cuda.is_available() else "cpu"
         device = script_args.reward_model_device if script_args.reward_model_device is not None else default_device
         reward_config = config_class.from_pretrained(
@@ -821,7 +797,7 @@ def main():
             trust_remote_code=script_args.trust_remote_code,
             cache_dir=script_args.cache_dir,
         )
-        reward_model = AutoModelForSequenceClassification.from_pretrained(
+        reward_model = AutoModelForCausalLMWithValueHead.from_pretrained(
             script_args.reward_model_name_or_path,
             config=reward_config,
             load_in_8bit=script_args.load_in_8bit,
@@ -830,9 +806,9 @@ def main():
         reward_model.to(device)
         reward_tokenizer = AutoTokenizer.from_pretrained(script_args.reward_model_name_or_path, **tokenizer_kwargs)
     else:
-        raise ValueError("Error,reward_model_name_or_path is None,RLHF show load a reward model")
+        raise ValueError("Error,reward_model_name_or_path is None,RLHF should load a reward model")
 
-    config = PPOConfig(
+    ppo_config = PPOConfig(
         steps=script_args.max_steps,
         model_name=script_args.model_name_or_path,
         learning_rate=script_args.learning_rate,
@@ -850,6 +826,189 @@ def main():
     )
 
     set_seed(config.seed)
+
+    # 配置data_collator
+    tokenizer.padding_side = "left"  # use left-padding in generation while using right-padding in training
+    data_collator = DataCollatorWithPadding(tokenizer)
+
+    # 配置optimizer和lr_schedule
+
+    # Get dataset
+
+    if script_args.dataset_name is not None:
+        # Downloading and loading a dataset from the hub.
+        raw_datasets = load_dataset(
+            script_args.dataset_name,
+            script_args.dataset_config_name,
+            cache_dir=script_args.cache_dir,
+        )
+
+        if "validation" not in raw_datasets.keys():
+            raw_datasets["validation"] = load_dataset(
+                script_args.dataset_name,
+                script_args.dataset_config_name,
+                split=f"train[:{script_args.validation_split_percentage}%]",
+                cache_dir=script_args.cache_dir,
+            )
+            raw_datasets["train"] = load_dataset(
+                script_args.dataset_name,
+                script_args.dataset_config_name,
+                split=f"train[{script_args.validation_split_percentage}%:]",
+                cache_dir=script_args.cache_dir,
+            )
+
+    else:
+        data_files = {}
+        if script_args.train_data is not None:
+            train_dof = [s.strip() for s in script_args.train_data.strip().split(",")]
+        else:
+            raise ValueError("train data should not be none")
+        # direcotory_or_file
+        train_files = []
+        for dof in train_dof:
+            if os.path.exists(dof) and os.path.isfile(dof):
+                train_files.append(dof)
+            elif os.path.exists(dof) and os.path.isdir(dof):
+                files = (
+                    glob.glob(f"{dof}/**/*.txt", recursive=True)
+                    + glob.glob(f"{dof}/**/*.json", recursive=True)
+                    + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                )
+                types = [f.split(".")[-1] for f in files]
+                if len(set(types)) > 1:
+                    raise ValueError(f"train files must be same type, e.g. all txt or all jsonl, but got {types}")
+                train_files.extend(files)
+            else:
+                raise ValueError("train data should be valid file path or direcotory path split by ','")
+        data_files["train"] = train_files
+
+        if script_args.dev_data is not None:
+            dev_dof = [s.strip() for s in script_args.dev_data.split(",")]
+            dev_files = []
+            for dof in dev_dof:
+                if os.path.exists(dof) and os.path.isfile(dof):
+                    dev_files.append(dof)
+                elif os.path.exists(dof) and os.path.isdir(dof):
+                    files = (
+                        glob.glob(f"{dof}/**/*.txt", recursive=True)
+                        + glob.glob(f"{dof}/**/*.json", recursive=True)
+                        + glob.glob(f"{dof}/**/*.jsonl", recursive=True)
+                    )
+                    types = [f.split(".")[-1] for f in files]
+                    if len(set(types)) > 1:
+                        raise ValueError(f"train files must be same type, e.g. all txt or all jsonl, but got {types}")
+                    dev_files.extend(files)
+                else:
+                    raise ValueError("train data should be valid file path or direcotory path split by ','")
+            logger.info(f"eval files: {dev_files}")
+            data_files["validation"] = dev_files
+
+        raw_datasets = load_dataset(
+            "json",
+            data_files=data_files,
+            cache_dir=script_args.cache_dir,
+        )
+
+        # If no validation data is there, validation_split_percentage will be used to divide the dataset.
+        if "validation" not in raw_datasets.keys():
+            raw_datasets["validation"] = load_dataset(
+                "json",
+                data_files=data_files,
+                split=f"train[:{script_args.validation_split_percentage}%]",
+                cache_dir=script_args.cache_dir,
+            )
+
+            raw_datasets["train"] = load_dataset(
+                "json",
+                data_files=data_files,
+                split=f"train[{script_args.validation_split_percentage}%:]",
+                cache_dir=script_args.cache_dir,
+            )
+
+    logger.info(f"Raw datasets: {raw_datasets}")
+    # Preprocessing the datasets
+    preprocessing_function_train = functools.partial(
+        preprocess_ppo_function,
+        tokenizer=tokenizer,
+        template=template,
+        max_source_length=script_args.max_source_length,
+        max_target_length=script_args.max_target_length,
+    )
+
+    full_max_length = script_args.max_source_length + script_args.max_target_length
+    train_dataset = None
+    max_train_samples = 0
+    if rlhf_training_args.do_train:
+        if "train" not in raw_datasets:
+            raise ValueError("--do_train requires a train dataset")
+
+        train_dataset = raw_datasets["train"]
+        max_train_samples = len(train_dataset)
+        if script_args.max_train_samples is not None and script_args.max_train_samples > 0:
+            max_train_samples = min(len(train_dataset), script_args.max_train_samples)
+            train_dataset = train_dataset.select(range(max_train_samples))
+        logger.debug(f"Example train_dataset[0]: {train_dataset[0]}")
+
+        with rlhf_training_args.main_process_first(desc="Train dataset tokenization"):
+            tokenized_dataset = train_dataset.shuffle().map(
+                preprocessing_function_train,
+                batched=True,
+                num_proc=script_args.preprocessing_num_workers,
+                remove_columns=train_dataset.column_names,
+                load_from_cache_file=not script_args.overwrite_cache,
+                desc="Running tokenizer on dataset",
+            )
+
+            train_dataset = tokenized_dataset.filter(
+                lambda x: 0 < len(x["input_ids_rejected"]) <= full_max_length
+                and 0 < len(x["input_ids_chosen"]) <= full_max_length
+            )
+            logger.debug(f"Num train_samples: {len(train_dataset)}")
+            logger.debug("Tokenized training example:")
+            logger.debug(tokenizer.decode(train_dataset[0]["input_ids_chosen"]))
+
+    eval_dataset = None
+    max_eval_samples = 0
+    if rlhf_training_args.do_eval:
+        with rlhf_training_args.main_process_first(desc="Eval dataset tokenization"):
+            if "validation" not in raw_datasets:
+                raise ValueError("--do_eval requires a validation dataset")
+            eval_dataset = raw_datasets["validation"]
+            max_eval_samples = len(eval_dataset)
+            if script_args.max_eval_samples is not None and script_args.max_eval_samples > 0:
+                max_eval_samples = min(len(eval_dataset), script_args.max_eval_samples)
+                eval_dataset = eval_dataset.select(range(max_eval_samples))
+            logger.debug(f"Example eval_dataset[0]: {eval_dataset[0]}")
+            tokenized_dataset = eval_dataset.map(
+                preprocessing_function_train,
+                batched=True,
+                num_proc=script_args.preprocessing_num_workers,
+                remove_columns=eval_dataset.column_names,
+                load_from_cache_file=not script_args.overwrite_cache,
+                desc="Running tokenizer on dataset",
+            )
+
+            eval_dataset = tokenized_dataset.filter(
+                lambda x: 0 < len(x["input_ids_rejected"]) <= full_max_length
+                and 0 < len(x["input_ids_chosen"]) <= full_max_length
+            )
+            logger.debug(f"Num eval_samples: {len(eval_dataset)}")
+            logger.debug("Tokenized eval example:")
+            logger.debug(tokenizer.decode(eval_dataset[0]["input_ids_chosen"]))
+
+    trainer = RLHFTrianer(
+        args=script_args,
+        reward_model=reward_model,
+        reward_tokenizer=reward_tokenizer,
+        config=ppo_config,
+        model=model,
+        ref_model=None,
+        tokenizer=tokenizer,
+        dataset=None,
+        data_collator=data_collator,
+    )
+
+    trainer.ppo_train()
 
 
 if __name__ == "__main__":
