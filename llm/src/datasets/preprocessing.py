@@ -163,3 +163,7 @@ def preprocess_reward_function(examples, tokenizer, template, max_source_length,
         model_inputs["rejected_ids"].append(rejected_ids)
 
     return model_inputs
+
+
+def preprocess_ppo_function(example, tokenizer, template, max_source_length, max_target_length):
+    pass
