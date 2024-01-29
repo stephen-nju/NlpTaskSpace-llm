@@ -26,6 +26,7 @@ from transformers import (
     AutoModel,
     AutoModelForCausalLM,
     AutoTokenizer,
+    BitsAndBytesConfig,
     BloomForCausalLM,
     BloomTokenizerFast,
     DataCollatorWithPadding,
@@ -172,8 +173,6 @@ class ScriptArguments:
     model_name_or_path: Optional[str] = field(
         default=None, metadata={"help": "The model checkpoint for weights initialization."}
     )
-    reward_model_name_or_path: Optional[str] = field(default=None, metadata={"help": "The reward model name"})
-    reward_model_device: Optional[str] = field(default="cuda:0", metadata={"help": "The reward model device"})
     tokenizer_name_or_path: Optional[str] = field(
         default=None, metadata={"help": "The tokenizer for weights initialization."}
     )
@@ -181,6 +180,7 @@ class ScriptArguments:
     quantization_bit: Optional[str] = field(
         default=None, metadata={"help": "quantization bit when loading model", "choices": ["4bit", "8bit"]}
     )
+
     cache_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
@@ -204,10 +204,20 @@ class ScriptArguments:
         default="auto",
         metadata={"help": "Device to map model to. If `auto` is passed, the device will be selected automatically. "},
     )
+    # reward model arguments
+    reward_model_name_or_path: Optional[str] = field(default=None, metadata={"help": "The reward model name"})
+
+    reward_model_quantization_bit: Optional[str] = field(
+        default=None, metadata={"help": "reward model quantization_bit", "choices": ["4bit", "8bit"]}
+    )
+
     trust_remote_code: bool = field(
         default=True,
         metadata={"help": "Whether to trust remote code when loading a model from a remote checkpoint."},
     )
+
+    ref_model_name_or_path: Optional[str] = field(default=None, metadata={"help": "using a reference model"})
+
     # Dataset arguments
     dataset_name: Optional[str] = field(
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
@@ -789,44 +799,81 @@ def main():
 
     # Load reward model
     if script_args.reward_model_name_or_path is not None:
-        default_device = "cuda" if torch.cuda.is_available() else "cpu"
-        device = script_args.reward_model_device if script_args.reward_model_device is not None else default_device
         reward_config = config_class.from_pretrained(
             script_args.reward_model_name_or_path,
             torch_dtype=torch_dtype,
             trust_remote_code=script_args.trust_remote_code,
             cache_dir=script_args.cache_dir,
         )
+
+        if script_args.reward_model_quantization_bit is not None:
+            print(f"Quantized to {script_args.reward_model_quantization_bit}")
+            if script_args.quantization_bit == "4bit":
+                # load_in_4bit = (True,)
+                reward_model_quantization_config = BitsAndBytesConfig(
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+            elif script_args.args.quantization_bit == "8bit":
+                reward_model_quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+            else:
+                raise ValueError("unsupport quantization_bit")
+
         reward_model = AutoModelForCausalLMWithValueHead.from_pretrained(
             script_args.reward_model_name_or_path,
             config=reward_config,
-            load_in_8bit=script_args.load_in_8bit,
             trust_remote_code=script_args.trust_remote_code,
+            quantization_config=reward_model_quantization_config,
         )
-        reward_model.to(device)
+        reward_model.requires_grad_(False)
+        reward_model.eval()
         reward_tokenizer = AutoTokenizer.from_pretrained(script_args.reward_model_name_or_path, **tokenizer_kwargs)
     else:
         raise ValueError("Error,reward_model_name_or_path is None,RLHF should load a reward model")
 
+    # create Reference model
+    ref_model = None
+    if script_args.ref_model_name_or_path is not None:
+        # todo 加载ref model
+        # ref model需要和base 模型保持相同的架构
+        config = config_class.from_pretrained(
+            script_args.ref_model_name_or_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=script_args.trust_remote_code,
+            cache_dir=script_args.cache_dir,
+        )
+        ref_model = model_class.from_pretrained(
+            script_args.ref_model_name_or_path,
+            config=config,
+            cache_dir=script_args.cache_dir,
+            trust_remote_code=script_args.trust_remote_code,
+        )
+        ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
+        patch_valuehead_model(ref_model)
+        logger.info("Created reference model from {}".format(script_args.ref_model_name_or_path))
+
+        # value head is not need for reference model
+    # setting ppo config
     ppo_config = PPOConfig(
-        steps=script_args.max_steps,
-        model_name=script_args.model_name_or_path,
-        learning_rate=script_args.learning_rate,
-        log_with=script_args.report_to,
-        batch_size=script_args.batch_size,
-        mini_batch_size=script_args.mini_batch_size,
-        gradient_accumulation_steps=script_args.gradient_accumulation_steps,
+        task_name="ppo",
+        model_name=script_args.model_name_or_path,  # rlhf trainging arguments
+        mini_batch_size=rlhf_training_args.mini_batch_size,
         optimize_cuda_cache=True,
-        early_stopping=script_args.early_stopping,
-        target_kl=script_args.target_kl,
-        seed=script_args.seed,
-        init_kl_coef=script_args.init_kl_coef,
-        adap_kl_ctrl=script_args.adap_kl_ctrl,
+        target_kl=rlhf_training_args.target_kl,
+        init_kl_coef=rlhf_training_args.init_kl_coef,
+        adap_kl_ctrl=rlhf_training_args.adap_kl_ctrl,
+        early_stopping=rlhf_training_args.early_stopping,
+        learning_rate=rlhf_training_args.learning_rate,
+        seed=rlhf_training_args.seed,
+        steps=rlhf_training_args.max_steps,
+        batch_size=rlhf_training_args.batch_size,
+        gradient_accumulation_steps=rlhf_training_args.gradient_accumulation_steps,
+        log_with=rlhf_training_args.report_to,
         project_kwargs={"logging_dir": rlhf_training_args.output_dir},
     )
 
     set_seed(config.seed)
-
     # 配置data_collator
     tokenizer.padding_side = "left"  # use left-padding in generation while using right-padding in training
     data_collator = DataCollatorWithPadding(tokenizer)
@@ -834,7 +881,6 @@ def main():
     # 配置optimizer和lr_schedule
 
     # Get dataset
-
     if script_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(
@@ -1002,7 +1048,7 @@ def main():
         reward_tokenizer=reward_tokenizer,
         config=ppo_config,
         model=model,
-        ref_model=None,
+        ref_model=ref_model,
         tokenizer=tokenizer,
         dataset=None,
         data_collator=data_collator,

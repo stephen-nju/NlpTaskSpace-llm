@@ -178,7 +178,7 @@ def main():
             num += 1
     if args.format == "product":
         with open(
-            os.path.join("/home/zb/NlpTaskSpace-llm/output/chanping/", f"{args.experiment_name}_response.json"),
+            os.path.join("/home/zb/NlpTaskSpace-llm/output/chanping/", f"{args.experiment_name}_response.txt"),
             "w",
             encoding="utf-8",
             newline="",
@@ -193,13 +193,13 @@ def main():
                         json.dumps(o["output"], ensure_ascii=False),
                     ]
                 )
-    else:
-        with open(
-            os.path.join("/home/zb/NlpTaskSpace-llm/output/ceping/", f"{args.experiment_name}_response.json"),
-            "w",
-            encoding="utf-8",
-        ) as g:
-            json.dump(output_data, g, ensure_ascii=False, indent=4)
+    # 多保留json便于测评
+    with open(
+        os.path.join("/home/zb/NlpTaskSpace-llm/output/ceping/", f"{args.experiment_name}_response.json"),
+        "w",
+        encoding="utf-8",
+    ) as g:
+        json.dump(output_data, g, ensure_ascii=False, indent=4)
 
 
 if __name__ == "__main__":
