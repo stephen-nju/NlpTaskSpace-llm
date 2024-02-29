@@ -14,14 +14,48 @@ def task_func1():
     print("执行任务1....")
     out = sp.run(
         """
-        export PROJECT_PATH=/home/zb/NlpTaskSpace-llm/ \
+        export PROJECT_PATH=/home/zb/code/LLaMA-Factory/ \
         && cd ${PROJECT_PATH} \
         && export PYTHONPATH=${PROJECT_PATH} \
         && export BAICHUAN2_13B=/data/SHARE/MODELS/BAICHUAN/Baichuan2-13B-Base/ \
-        && CUDA_VISIBLE_DEVICES=5 python scripts/merge_model_and_save_pretrain.py \
-            --model_name_or_path=/data/SHARE/MODELS/BAICHUAN/Baichuan2-13B-Base/ \
-            --lora_ckpt_path=/home/zb/saved_checkpoint/light_baichuan_base_pt_lr1e4_2epoch/last.ckpt/ \
-            --output_dir=/home/zb/saved_checkpoint/light_baichuan_base_pt_lr1e4_2epoch/merge/
+        && export BAICHUAN2_13B_CHAT=/data/SHARE/MODELS/BAICHUAN/Baichuan2-13B-Chat/ \
+        && export DS_CONFIG_STAGE_3=/home/zb/NlpTaskSpace-llm/config/deepspeed/zero_stage3_config.json \
+        && export DS_CONFIG_STAGE_2=/home/zb/NlpTaskSpace-llm/config/deepspeed/zero_stage2_config.json \
+        && MASTER_PORT=$(shuf -n 1 -i 10000-65535) \
+        && deepspeed --include=localhost:0,1,2,3,4,5,6,7 --master_port=${MASTER_PORT} --hostfile="" src/train_bash.py \
+            --deepspeed ${DS_CONFIG_STAGE_2} \
+            --stage ppo \
+            --do_train \
+            --template qwen \
+            --resize_vocab true \
+            --dataset who_are_you,livestream,param_qa,alpaca_zh_retained,sn_generate_part0,sn_generate_part1,short_title_part0,short_title_part1,long_title_part0,long_title_part1,long_title_part2,sn_title,sn_xhs,sn_seo_phb,sn_seo_cp,sn_seo_other,sn_seo_zc,sn_chat_ir,sn_chat_rc \
+            --overwrite_cache \
+            --model_name_or_path /data/SHARE/MODELS/Qwen/Qwen-14B/ \
+            --adapter_name_or_path /home/zb/saved_checkpoint/base_qwen_sft \
+            --create_new_adapter \
+            --report_to tensorboard \
+            --output_dir /home/zb/saved_checkpoint/ppo_qwen_sn_v12_lora_lr1e5_1epoch \
+            --overwrite_output_dir \
+            --reward_model /home/zb/saved_checkpoint/reward_qwen_sn_v12_lora_lr1e6_1epoch/ \
+            --reward_model_type lora \
+            --cutoff 2048 \
+            --top_k 0 \
+            --top_p 0.9 \
+            --finetuning_type lora \
+            --lora_target all \
+            --num_train_epochs 1 \
+            --warmup_ratio 0.1 \
+            --logging_steps 10 \
+            --lr_scheduler_type cosine \
+            --per_device_train_batch_size 4 \
+            --gradient_accumulation_steps 4 \
+            --save_steps 1000 \
+            --save_total_limit 2 \
+            --learning_rate 1e-5 \
+            --additional_target wte,lm_head \
+            --plot_loss \
+            --bf16 true \
+            --tf32 true
         """,
         shell=True,
         check=True,
@@ -41,7 +75,7 @@ def task_test():
     print(out)
 
 
-def task_test2():
+def task_func2():
     print("执行任务2....")
     out = sp.run(
         """
@@ -53,63 +87,18 @@ def task_test2():
     print(out)
 
 
-def task_func2():
-    print("执行任务2......")
-    out = sp.check_output(
-        """
-        export PROJECT_PATH=/home/zb/NlpTaskSpace-llm/ \
-        && cd ${PROJECT_PATH} \
-        && export PYTHONPATH=${PROJECT_PATH} \
-        && export BAICHUAN2_13B=/data/SHARE/MODELS/BAICHUAN/Baichuan2-13B-Base/ \
-        && export BAICHUAN2_13B_CHAT=/data/SHARE/MODELS/BAICHUAN/Baichuan2-13B-Chat/ \
-        && export DS_CONFIG_STAGE_3=/home/zb/NlpTaskSpace-llm/config/deepspeed/zero_stage3_config.json \
-        && export DS_CONFIG_STAGE_2=/home/zb/NlpTaskSpace-llm/config/deepspeed/zero_stage2_config.json \
-        && MASTER_PORT=$(shuf -n 1 -i 10000-65535) \
-        && echo ${MASTER_PORT} \
-        && echo ${PYTHONPATH} \
-        && deepspeed --include=localhost:0,1 --master_port=${MASTER_PORT} --hostfile="" --no_local_rank task/qwen/supervised_finetuning_lightning.py \
-            --deepspeed ${DS_CONFIG_STAGE_2} \
-            --overwrite_cache \
-            --model_name_or_path ${MODEL_PATH} \
-            --output_dir /home/zb/saved_checkpoint/light_baichuan_pt_v2_sft_sn_v5_tiger_lr2e4_1epoch \
-            --train_data /home/zb/suningGit/zb/train_data/v5/train/,/home/zb/suningGit/zb/train_data/tigerbot_sft_zh \
-            --dev_data /home/zb/suningGit/zb/train_data/v5/dev/ \
-            --max_epochs 1 \
-            --max_source_length 1024 \
-            --max_target_length 2048 \
-            --warmup_ratio 0.1 \
-            --per_device_train_batch_size 8 \
-            --per_device_eval_batch_size 8 \
-            --learning_rate 1e-4 \
-            --gradient_accumulation_steps 1 \
-            --preprocessing_num_workers 16 \
-            --save_steps 5000 \
-            --use_lora true \
-            --lora_target all \
-            --lora_rank 8 \
-            --lora_alpha 16 \
-            --use_slow_tokenizer \
-            --lr_scheduler_type cosine \
-            --low_cpu_mem_usage
-        """,
-        stderr=sp.STDOUT,
-        shell=True,
-    )
-    print(out)
-
-
 if __name__ == "__main__":
     # 为了防止全量和增量并发造成显存溢出，进而训练失败，设置同一时间只能有一个任务运行
     schedule = BlockingScheduler(executors={"default": ThreadPoolExecutor(1)})
     # schedule = BlockingScheduler()
     ##添加任务 依次往后顺延时间就行
-    after_trigger1 = (datetime.datetime.now() + datetime.timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S")
-    after_trigger2 = (datetime.datetime.now() + datetime.timedelta(seconds=4)).strftime("%Y-%m-%d %H:%M:%S")
+    after_trigger1 = (datetime.datetime.now() + datetime.timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
+    # after_trigger2 = (datetime.datetime.now() + datetime.timedelta(hours=10)).strftime("%Y-%m-%d %H:%M:%S")
     trigger1 = DateTrigger(run_date=after_trigger1)
-    trigger2 = DateTrigger(run_date=after_trigger2)
+    # trigger2 = DateTrigger(run_date=after_trigger2)
     # 添加定时任务
-    schedule.add_job(task_test, trigger1)
-    schedule.add_job(task_func2, trigger2)
+    schedule.add_job(task_func1, trigger1)
+    # schedule.add_job(task_func2, trigger2)
     # 启动调度器
     schedule.print_jobs()
 
@@ -117,3 +106,36 @@ if __name__ == "__main__":
         schedule.start()
     except (KeyboardInterrupt, SystemExit):
         schedule.shutdown()
+
+
+# deepspeed --include=localhost:0,1,2,3,4,5,6,7 --master_port=${MASTER_PORT} --hostfile="" src/train_bash.py \
+# 	--deepspeed ${DS_CONFIG_STAGE_2} \
+# 	--stage rm \
+# 	--do_train \
+# 	--template qwen \
+# 	--dataset comparison_gpt4_zh \
+# 	--model_name_or_path /data/SHARE/MODELS/Qwen/Qwen-14B/ \
+# 	--resize_vocab true \
+# 	--adapter_name_or_path /home/zb/saved_checkpoint/base_qwen_sft \
+# 	--create_new_adapter \
+# 	--report_to tensorboard \
+# 	--output_dir /home/zb/saved_checkpoint/reward_qwen_sn_v12_lora_lr1e6_1epoch \
+# 	--overwrite_output_dir \
+# 	--overwrite_cache \
+# 	--cutoff 2048 \
+# 	--num_train_epochs 1 \
+# 	--finetuning_type lora \
+# 	--lora_target all \
+# 	--warmup_ratio 0.1 \
+# 	--logging_steps 10 \
+# 	--lr_scheduler_type cosine \
+# 	--per_device_train_batch_size 8 \
+# 	--per_device_eval_batch_size 8 \
+# 	--save_steps 1000 \
+# 	--save_total_limit 2 \
+# 	--learning_rate 1e-6 \
+# 	--additional_target wte,lm_head \
+# 	--bf16 true \
+# 	--tf32 true
+
+# ppo 模型训练

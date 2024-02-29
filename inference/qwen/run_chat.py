@@ -173,7 +173,7 @@ def main():
             response, history = chat(model, tokenizer, content, history=None)
             output["output"] = response
             output_data.append(output)
-            if num % 20 == 0:
+            if num % 5 == 0:
                 print(f"num=={num},response={response}")
             num += 1
     if args.format == "product":

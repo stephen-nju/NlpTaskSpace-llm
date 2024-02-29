@@ -16,14 +16,11 @@ export QWEN_14B_BASE=/data/SHARE/MODELS/Qwen/Qwen-14B/Qwen-14B/
 # 	--format=product \
 # 	--experiment_name=chanping_test_v12_1e4
 
-CUDA_VISIBLE_DEVICES=7 python inference/qwen/run_chat.py \
-	--model_name_or_path=/home/zb/saved_checkpoint/ppo_qwen_sn_v12_lora_lr1e6_2epoch/checkpoint-200/merge/ \
-	--data_path=/home/zb/NlpTaskSpace-llm/data/chanping_test.json \
+CUDA_VISIBLE_DEVICES=0 python inference/qwen/reward_score.py \
+	--reward_model_name_or_path=/home/zb/saved_checkpoint/reward_qwen_sn_v12_lora_lr1e6_1epoch/merge \
+	--vhead_path=/home/zb/saved_checkpoint/reward_qwen_sn_v12_lora_lr1e6_1epoch/ \
+	--data_path=/home/zb/LLaMA-Factory/data/comparison_gpt4_data_zh.json \
 	--format=product \
 	--experiment_name=chanping_test_ppo_200
 
-# CUDA_VISIBLE_DEVICES=5 python inference/qwen/run_chat.py \
-# 	--model_name_or_path=/home/zb/saved_checkpoint/base_qwen_sn_v11_lora_lr1e-4_3epoch/merge/ \
-# 	--data_path=/data/SHARE/tmpt/sn_chat_dev.json \
-# 	--format=raw \
-# 	--experiment_name=sn_chat_dev
+# --data_path=/home/zb/NlpTaskSpace-llm/data/chanping_test.json \
